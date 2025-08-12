@@ -19,7 +19,7 @@ from torchvision.utils import make_grid
 from tqdm.auto import tqdm
 
 import wandb
-from tread_diffusion import DiT
+from tread_diffusion import DiT, DiT_models
 
 
 def make_beta_schedule(num_steps: int, beta_start: float = 1e-4, beta_end: float = 2e-2) -> Tensor:
@@ -67,7 +67,7 @@ def main() -> None:
     load_dotenv()
     parser = argparse.ArgumentParser(description="Train DiT on MNIST (pixel space)")
     parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--timesteps", type=int, default=1000)
     parser.add_argument("--rope", type=str, default="none", choices=["none", "axial", "golden_gate"])
@@ -101,15 +101,10 @@ def main() -> None:
 
     # Small dit (hopeflly sane defaults for this depth)
     rope_arg = None if args.rope == "none" else args.rope
-    route_config = {"start_block": 2, "end_block": 4, "rate": 0.5, "mix_factor": 0.5}
-    model = DiT(
+    route_config = {"start_block": 2, "end_block": 10, "rate": 0.5, "mix_factor": 0.5}
+    model = DiT_models["DiT-S/2"](
         input_size=28,
-        patch_size=2,
         in_channels=1,
-        hidden_size=192,
-        depth=6,
-        num_heads=6,
-        mlp_ratio=4.0,
         num_classes=10,
         learn_sigma=False,
         rope=rope_arg,
