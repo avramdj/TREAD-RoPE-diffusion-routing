@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 try:
     from torchvision import datasets, transforms
@@ -20,10 +21,10 @@ except Exception as e:  # pragma: no cover
         "This example requires torchvision. Install with `uv add torchvision` or `pip install torchvision`."
     ) from e
 
-import wandb
 from dotenv import load_dotenv
 from torchmetrics.image.fid import FrechetInceptionDistance
 
+import wandb
 from tread_diffusion import DiT
 
 
@@ -42,10 +43,43 @@ def precompute_alphas(betas: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
 
 @torch.no_grad()
 def q_sample(x0: Tensor, t: Tensor, noise: Tensor, sqrt_ac: Tensor, sqrt_1m_ac: Tensor) -> Tensor:
-    # Gather per batch
     s1 = sqrt_ac.gather(0, t).view(-1, 1, 1, 1)
     s2 = sqrt_1m_ac.gather(0, t).view(-1, 1, 1, 1)
     return s1 * x0 + s2 * noise
+
+
+@torch.no_grad()
+def sample_model(
+    model: DiT,
+    *,
+    num_images: int,
+    device: torch.device,
+    num_steps: int,
+    classes: Tensor | None = None,
+    height: int = 28,
+    width: int = 28,
+) -> Tensor:
+    # Prefer ODE rectified flow sampler
+    try:
+        return model.sample_ode_rectified(
+            num_images,
+            height=height,
+            width=width,
+            device=device,
+            num_steps=num_steps,
+            class_labels=classes.long() if classes is not None else None,
+        )
+    except Exception:
+        # Fallback: naive Euler reverse flow
+        x = torch.randn(num_images, 1, height, width, device=device)
+        y = classes if classes is not None else torch.randint(0, 10, (num_images,), device=device)
+        ts = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
+        dt = -1.0 / num_steps
+        for t in ts[:-1]:
+            t_vec = t.expand(num_images).to(device)
+            v = model(x, t_vec, y)
+            x = x + (-v) * dt
+        return x
 
 
 def main() -> None:
@@ -61,9 +95,9 @@ def main() -> None:
     parser.add_argument("--save-dir", type=str, default="examples/checkpoints")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fid-samples", type=int, default=256)
-    parser.add_argument("--log-fid-every", type=int, default=1)
-    parser.add_argument("--log-images-every", type=int, default=5)
-    parser.add_argument("--grid-n", type=int, default=64)
+    parser.add_argument("--log-fid-every", type=int, default=10)
+    parser.add_argument("--log-images-every", type=int, default=1)
+    parser.add_argument("--grid-n", type=int, default=16)
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -126,8 +160,8 @@ def main() -> None:
     for epoch in range(1, args.epochs + 1):
         running_loss = 0.0
         num_batches = 0
-        for images, labels in train_loader:
-            images = images.to(device)  # [B,1,28,28]
+        for images, labels in tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}", leave=False):
+            images = images.to(device)  # [B,1,8,8]
             labels = labels.to(device)
 
             # Sample random timesteps per batch element
@@ -148,6 +182,7 @@ def main() -> None:
 
             running_loss += loss.item()
             num_batches += 1
+            tqdm.write("") if False else None
 
         avg = running_loss / max(1, num_batches)
         wandb.log({"train/loss": avg, "epoch": epoch})
@@ -172,27 +207,20 @@ def main() -> None:
                     if real_added >= args.fid_samples:
                         break
 
-                # Fake images via simple DDPM sampling
                 n = min(args.fid_samples, args.batch_size)
                 remain = args.fid_samples
                 sample_images = []
                 while remain > 0:
                     b = min(remain, n)
-                    x_t = torch.randn(b, 1, 28, 28, device=device)
+                    # Use library sampler (SDE) or fallback
                     y = torch.randint(0, 10, (b,), device=device)
-                    for t_step in reversed(range(args.timesteps)):
-                        t = torch.full((b,), float(t_step), device=device)
-                        eps = model(x_t, t, y)
-                        beta_t = betas[t_step]
-                        alpha_t = 1.0 - beta_t
-                        alpha_cum_t = (1.0 - betas[: t_step + 1]).prod()
-                        mean = (1.0 / math.sqrt(alpha_t)) * (
-                            x_t - (beta_t / math.sqrt(1 - alpha_cum_t)) * eps
-                        )
-                        if t_step > 0:
-                            x_t = mean + torch.sqrt(beta_t) * torch.randn_like(x_t)
-                        else:
-                            x_t = mean
+                    x_t = sample_model(
+                        model,
+                        num_images=b,
+                        device=device,
+                        num_steps=args.timesteps,
+                        classes=y,
+                    )
                     fake = (x_t + 1.0) * 0.5
                     if epoch % args.log_images_every == 0 and len(sample_images) < args.grid_n:
                         take = min(args.grid_n - len(sample_images), fake.shape[0])
@@ -208,15 +236,30 @@ def main() -> None:
             wandb.log({"eval/fid": fid_value, "epoch": epoch})
             print(f"Epoch {epoch}: FID={fid_value:.3f}")
             model.train()
-            if epoch % args.log_images_every == 0 and sample_images:
+
+        # Independent image grid logging
+        if epoch % args.log_images_every == 0:
+            model.eval()
+            with torch.no_grad():
+                b = args.grid_n
+                y = torch.randint(0, 10, (b,), device=device)
+                x_t = sample_model(
+                    model,
+                    num_images=b,
+                    device=device,
+                    num_steps=args.timesteps,
+                    classes=y,
+                )
+                imgs = (x_t + 1.0) * 0.5
                 grid = make_grid(
-                    torch.cat(sample_images, dim=0)[: args.grid_n],
+                    imgs.detach().cpu()[: args.grid_n],
                     nrow=int(math.sqrt(args.grid_n)),
                     padding=2,
                     normalize=True,
                     value_range=(0, 1),
                 )
                 wandb.log({"viz/samples_grid": wandb.Image(grid), "epoch": epoch})
+            model.train()
         ckpt_path = Path(args.save_dir) / f"dit_mnist_epoch{epoch}.pt"
         torch.save({"model": model.state_dict()}, ckpt_path)
         print(f"Saved checkpoint to {ckpt_path}")

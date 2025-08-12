@@ -11,8 +11,10 @@ dependencies = [
     "ruff>=0.12.8",
     "timm>=1.0.19",
     "torch>=2.8.0",
+    "torchdiffeq>=0.2.5",
     "torchmetrics[image]>=1.8.1",
     "torchvision>=0.23.0",
+    "tqdm>=4.67.1",
     "wandb>=0.21.1",
 ]
 

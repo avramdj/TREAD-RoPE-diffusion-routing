@@ -7,6 +7,7 @@ from beartype import beartype as typechecker
 from jaxtyping import Float, Int, jaxtyped
 from timm.models.vision_transformer import Attention, Mlp, PatchEmbed
 from torch import Tensor
+from torchdiffeq import odeint
 
 from tread_diffusion.attention import FlexAttentionWithRoPE, RopeKind
 
@@ -331,6 +332,46 @@ class DiT(nn.Module):
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
         eps = torch.cat([half_eps, half_eps], dim=0)
         return torch.cat([eps, rest], dim=1)
+
+    @typed
+    def sample_ode_rectified(
+        self,
+        num_images: int,
+        *,
+        height: int,
+        width: int,
+        device: torch.device,
+        num_steps: int = 50,
+        class_labels: Int[Tensor, "batch"] | None = None,
+        method: str = "rk4",
+    ) -> Float[Tensor, "batch 1 height width"]:
+        """Rectified Flow ODE sampling using torchdiffeq."""
+
+        batch_size = num_images
+        channels = 1
+        x1 = torch.randn(batch_size, channels, height, width, device=device)
+        if class_labels is None:
+            class_labels = torch.randint(0, 10, (batch_size,), device=device)
+
+        eval_model = self.to(device).eval()
+
+        class ODEFunc(nn.Module):
+            def __init__(self, outer: DiT, labels: Tensor):
+                super().__init__()
+                self.outer = outer
+                self.labels = labels
+
+            def forward(self, t: Tensor, x: Tensor) -> Tensor:
+                t_vec = t.expand(x.shape[0]).to(x)
+                with torch.no_grad():
+                    v = eval_model(x, t_vec, self.labels)
+                return -v
+
+        func = ODEFunc(self, class_labels)
+        ts = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
+        x_path = odeint(func, x1, ts, method=method)
+        x0 = x_path[-1]
+        return x0
 
 
 @typed
