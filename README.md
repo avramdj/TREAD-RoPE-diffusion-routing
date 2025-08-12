@@ -1,6 +1,6 @@
 # TREAD
 
-This is a PyTorch implementation of [TREAD](https://arxiv.org/abs/2501.04765) model.
+This is a PyTorch implementation of [TREAD](https://arxiv.org/abs/2501.04765).
 
 My implementation enhances TREAD to support RoPE variants and other positional encodings. But the main idea of the paper is presented in the following diagram:
 
