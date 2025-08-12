@@ -2,11 +2,10 @@ from abc import ABC
 
 import torch
 import torch.nn as nn
-from beartype import beartype as typechecker
-from jaxtyping import Float, jaxtyped
+from jaxtyping import Float
 from torch import Tensor
 
-typed = jaxtyped(typechecker=typechecker)
+from tread_diffusion.typing import typed
 
 
 class RopeImpl(ABC, nn.Module):

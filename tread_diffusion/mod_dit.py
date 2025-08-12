@@ -3,15 +3,13 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
-from beartype import beartype as typechecker
-from jaxtyping import Float, Int, jaxtyped
+from jaxtyping import Float, Int
 from timm.models.vision_transformer import Attention, Mlp, PatchEmbed
 from torch import Tensor
 from torchdiffeq import odeint
 
 from tread_diffusion.attention import FlexAttentionWithRoPE, RopeKind
-
-typed = jaxtyped(typechecker=typechecker)
+from tread_diffusion.typing import typed
 
 
 @typed
@@ -177,6 +175,7 @@ class FlexRoPEAttention(nn.Module):
             rope_kind=rope_kind,
         )
 
+    @typed
     def forward(
         self, x: Float[Tensor, "batch seq_len hidden_size"]
     ) -> Float[Tensor, "batch seq_len hidden_size"]:
@@ -226,6 +225,7 @@ class DiT(nn.Module):
         num_classes: int = 1000,
         learn_sigma: bool = True,
         rope: RopeKind | None = None,
+        route_config: dict | None = None,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -236,6 +236,14 @@ class DiT(nn.Module):
         self.rope = rope
         if self.rope is not None and self.rope not in FlexAttentionWithRoPE.ROPE_KINDS:
             raise ValueError("rope must be one of 'axial', 'golden_gate', or None")
+
+        # Routing config with sane defaults
+        default_route = {"start_block": 2, "end_block": 24, "rate": 0.5}
+        self.route_config = (
+            {**default_route, **{k: v for k, v in (route_config or {}).items() if v is not None}}
+            if route_config is not None
+            else {}
+        )
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -310,8 +318,47 @@ class DiT(nn.Module):
         t = self.t_embedder(t)
         y = self.y_embedder(y, self.training)
         c = t + y
-        for block in self.blocks:
-            x = block(x, c)
+        storage = None
+        route_indices = None
+        if self.route_config:
+            start_block = int(self.route_config["start_block"])  # type: ignore[index]
+            end_block = int(self.route_config["end_block"])  # type: ignore[index]
+            route_rate = float(self.route_config["rate"])  # type: ignore[index]
+            mix_factor = float(self.route_config.get("mix_factor", 0.5))
+
+        for i, block in enumerate(self.blocks):
+            if not self.route_config:
+                x = block(x, c)
+                continue
+
+            if i < start_block or i > end_block:
+                x = block(x, c)
+                continue
+
+            if i == start_block and route_indices is None:
+                _, L, _ = x.shape
+                num_to_route = max(1, int(L * route_rate))
+                idx = torch.randperm(L, device=x.device)
+                route_indices = idx[:num_to_route]
+                storage = x[:, route_indices, :].clone()
+
+            x_full = x
+            # Process block on full tokens
+            x_full = block(x_full, c)
+
+            if i < end_block:
+                # Overwrite routed positions with cached tokens (bypass)
+                x_full = x_full.clone()
+                x_full[:, route_indices, :] = storage  # type: ignore[index]
+            else:
+                # end_block: mix back and clear
+                routed = x_full[:, route_indices, :]  # type: ignore[index]
+                mixed = mix_factor * routed + (1.0 - mix_factor) * storage  # type: ignore[operator]
+                x_full[:, route_indices, :] = mixed  # type: ignore[index]
+                storage = None
+                route_indices = None
+
+            x = x_full
         x = self.final_layer(x, c)
         x = self.unpatchify(x)
         return x

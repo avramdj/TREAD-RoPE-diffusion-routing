@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import math
 import os
 from pathlib import Path
@@ -8,21 +9,14 @@ from typing import Tuple
 
 import torch
 import torch.nn.functional as F
+from dotenv import load_dotenv
 from torch import Tensor
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
-
-try:
-    from torchvision import datasets, transforms
-    from torchvision.utils import make_grid
-except Exception as e:  # pragma: no cover
-    raise SystemExit(
-        "This example requires torchvision. Install with `uv add torchvision` or `pip install torchvision`."
-    ) from e
-
-from dotenv import load_dotenv
 from torchmetrics.image.fid import FrechetInceptionDistance
+from torchvision import datasets, transforms
+from torchvision.utils import make_grid
+from tqdm.auto import tqdm
 
 import wandb
 from tread_diffusion import DiT
@@ -59,27 +53,14 @@ def sample_model(
     height: int = 28,
     width: int = 28,
 ) -> Tensor:
-    # Prefer ODE rectified flow sampler
-    try:
-        return model.sample_ode_rectified(
-            num_images,
-            height=height,
-            width=width,
-            device=device,
-            num_steps=num_steps,
-            class_labels=classes.long() if classes is not None else None,
-        )
-    except Exception:
-        # Fallback: naive Euler reverse flow
-        x = torch.randn(num_images, 1, height, width, device=device)
-        y = classes if classes is not None else torch.randint(0, 10, (num_images,), device=device)
-        ts = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
-        dt = -1.0 / num_steps
-        for t in ts[:-1]:
-            t_vec = t.expand(num_images).to(device)
-            v = model(x, t_vec, y)
-            x = x + (-v) * dt
-        return x
+    return model.sample_ode_rectified(
+        num_images,
+        height=height,
+        width=width,
+        device=device,
+        num_steps=num_steps,
+        class_labels=classes.long() if classes is not None else None,
+    )
 
 
 def main() -> None:
@@ -95,15 +76,14 @@ def main() -> None:
     parser.add_argument("--save-dir", type=str, default="examples/checkpoints")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fid-samples", type=int, default=256)
-    parser.add_argument("--log-fid-every", type=int, default=10)
-    parser.add_argument("--log-images-every", type=int, default=1)
-    parser.add_argument("--grid-n", type=int, default=16)
+    parser.add_argument("--log-fid-every", type=int, default=100)
+    parser.add_argument("--log-images-every", type=int, default=10)
+    parser.add_argument("--grid-n", type=int, default=4)
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
 
-    # Data
     tfm = transforms.Compose(
         [
             transforms.ToTensor(),
@@ -119,8 +99,9 @@ def main() -> None:
         pin_memory=(device.type == "cuda"),
     )
 
-    # Model
+    # Small dit (hopeflly sane defaults for this depth)
     rope_arg = None if args.rope == "none" else args.rope
+    route_config = {"start_block": 2, "end_block": 4, "rate": 0.5, "mix_factor": 0.5}
     model = DiT(
         input_size=28,
         patch_size=2,
@@ -132,12 +113,18 @@ def main() -> None:
         num_classes=10,
         learn_sigma=False,
         rope=rope_arg,
+        route_config=route_config,
     ).to(device)
+
+    from torch._inductor import config as inductor_config
+
+    torch.set_float32_matmul_precision("high")
+    inductor_config.triton.cudagraphs = False
+    model = torch.compile(model, dynamic=True, fullgraph=False, mode="max-autotune-no-cudagraphs")
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
 
-    betas = make_beta_schedule(args.timesteps).to(device)
-    sqrt_ac, sqrt_1m_ac, _ = precompute_alphas(betas)
+    # RECTIFIED FLOW
 
     wandb_project = os.getenv("WANDB_PROJECT", "tread-diffusion-mnist")
     wandb.init(
@@ -148,32 +135,35 @@ def main() -> None:
             "lr": args.lr,
             "timesteps": args.timesteps,
             "rope": args.rope,
-            "model_hidden": 192,
-            "depth": 6,
-            "num_heads": 6,
+            "route_config": route_config,
         },
     )
 
     model.train()
     Path(args.save_dir).mkdir(parents=True, exist_ok=True)
 
+    use_amp = device.type == "cuda" and torch.cuda.is_bf16_supported()
+    amp_ctx = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if use_amp
+        else contextlib.nullcontext()
+    )
+
     for epoch in range(1, args.epochs + 1):
         running_loss = 0.0
         num_batches = 0
         for images, labels in tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}", leave=False):
-            images = images.to(device)  # [B,1,8,8]
+            images = images.to(device)
             labels = labels.to(device)
 
-            # Sample random timesteps per batch element
-            t = torch.randint(0, args.timesteps, (images.shape[0],), device=device)
-            noise = torch.randn_like(images)
-            x_t = q_sample(images, t, noise, sqrt_ac, sqrt_1m_ac)
+            x1 = torch.randn_like(images)
+            t = torch.rand(images.shape[0], device=device)
+            x_t = (1.0 - t).view(-1, 1, 1, 1) * x1 + t.view(-1, 1, 1, 1) * images
+            v_target = images - x1
 
-            # Forward (DiT expects t as float tensor)
-            t_float = t.float()
-            pred_noise = model(x_t, t_float, labels)
-
-            loss = F.mse_loss(pred_noise, noise)
+            with amp_ctx:
+                pred_v = model(x_t, t, labels)
+                loss = F.mse_loss(pred_v, v_target)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -192,7 +182,6 @@ def main() -> None:
         if epoch % args.log_fid_every == 0:
             fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
             model.eval()
-            # Real images
             real_added = 0
             with torch.no_grad():
                 for images, _ in train_loader:
@@ -212,7 +201,6 @@ def main() -> None:
                 sample_images = []
                 while remain > 0:
                     b = min(remain, n)
-                    # Use library sampler (SDE) or fallback
                     y = torch.randint(0, 10, (b,), device=device)
                     x_t = sample_model(
                         model,
@@ -237,7 +225,7 @@ def main() -> None:
             print(f"Epoch {epoch}: FID={fid_value:.3f}")
             model.train()
 
-        # Independent image grid logging
+        # Log images
         if epoch % args.log_images_every == 0:
             model.eval()
             with torch.no_grad():
