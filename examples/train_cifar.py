@@ -5,7 +5,6 @@ import contextlib
 import math
 import os
 from pathlib import Path
-from typing import Tuple
 
 import torch
 import torch.nn.functional as F
@@ -27,7 +26,7 @@ def make_beta_schedule(num_steps: int, beta_start: float = 1e-4, beta_end: float
     return betas
 
 
-def precompute_alphas(betas: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+def precompute_alphas(betas: Tensor) -> tuple[Tensor, Tensor, Tensor]:
     alphas = 1.0 - betas
     alphas_cumprod = torch.cumprod(alphas, dim=0)
     sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
@@ -50,8 +49,8 @@ def sample_model(
     device: torch.device,
     num_steps: int,
     classes: Tensor | None = None,
-    height: int = 28,
-    width: int = 28,
+    height: int = 32,
+    width: int = 32,
 ) -> Tensor:
     return model.sample_ode_rectified(
         num_images,
@@ -65,7 +64,7 @@ def sample_model(
 
 def main() -> None:
     load_dotenv()
-    parser = argparse.ArgumentParser(description="Train DiT on MNIST (pixel space)")
+    parser = argparse.ArgumentParser(description="Train DiT on CIFAR-10 (pixel space)")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -87,10 +86,10 @@ def main() -> None:
     tfm = transforms.Compose(
         [
             transforms.ToTensor(),
-            transforms.Normalize(mean=(0.5,), std=(0.5,)),  # scale to [-1, 1]
+            transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),  # scale to [-1, 1]
         ]
     )
-    train_ds = datasets.MNIST(root="examples/data", train=True, download=True, transform=tfm)
+    train_ds = datasets.CIFAR10(root="examples/data", train=True, download=True, transform=tfm)
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
@@ -99,12 +98,12 @@ def main() -> None:
         pin_memory=(device.type == "cuda"),
     )
 
-    # Small dit (hopeflly sane defaults for this depth)
+    # Small DiT (reasonable defaults)
     rope_arg = None if args.rope == "none" else args.rope
     route_config = {"start_block": 2, "end_block": 10, "rate": 0.5, "mix_factor": 0.5}
     model = DiT_models["DiT-S/2"](
-        input_size=28,
-        in_channels=1,
+        input_size=32,
+        in_channels=3,
         num_classes=10,
         learn_sigma=False,
         rope=rope_arg,
@@ -121,7 +120,7 @@ def main() -> None:
 
     # RECTIFIED FLOW
 
-    wandb_project = os.getenv("WANDB_PROJECT", "tread-diffusion-mnist")
+    wandb_project = os.getenv("WANDB_PROJECT", "tread-diffusion-cifar10")
     wandb.init(
         project=wandb_project,
         config={
@@ -182,12 +181,11 @@ def main() -> None:
                 for images, _ in train_loader:
                     images = images.to(device)
                     real = (images + 1.0) * 0.5
-                    real3 = real.repeat(1, 3, 1, 1)
-                    real3 = torch.nn.functional.interpolate(
-                        real3, size=(299, 299), mode="bilinear", align_corners=False
+                    real = torch.nn.functional.interpolate(
+                        real, size=(299, 299), mode="bilinear", align_corners=False
                     )
-                    fid.update(real3.clamp(0, 1), real=True)
-                    real_added += real3.shape[0]
+                    fid.update(real.clamp(0, 1), real=True)
+                    real_added += real.shape[0]
                     if real_added >= args.fid_samples:
                         break
 
@@ -203,16 +201,17 @@ def main() -> None:
                         device=device,
                         num_steps=args.timesteps,
                         classes=y,
+                        height=32,
+                        width=32,
                     )
                     fake = (x_t + 1.0) * 0.5
                     if epoch % args.log_images_every == 0 and len(sample_images) < args.grid_n:
                         take = min(args.grid_n - len(sample_images), fake.shape[0])
                         sample_images.append(fake[:take].detach().cpu())
-                    fake3 = fake.repeat(1, 3, 1, 1)
-                    fake3 = torch.nn.functional.interpolate(
-                        fake3, size=(299, 299), mode="bilinear", align_corners=False
+                    fake = torch.nn.functional.interpolate(
+                        fake, size=(299, 299), mode="bilinear", align_corners=False
                     )
-                    fid.update(fake3.clamp(0, 1), real=False)
+                    fid.update(fake.clamp(0, 1), real=False)
                     remain -= b
 
             fid_value = fid.compute().item()
@@ -232,6 +231,8 @@ def main() -> None:
                     device=device,
                     num_steps=args.timesteps,
                     classes=y,
+                    height=32,
+                    width=32,
                 )
                 imgs = (x_t + 1.0) * 0.5
                 grid = make_grid(
@@ -243,9 +244,9 @@ def main() -> None:
                 )
                 wandb.log({"viz/samples_grid": wandb.Image(grid), "epoch": epoch})
             model.train()
-        ckpt_path = Path(args.save_dir) / f"dit_mnist_epoch{epoch}.pt"
-        torch.save({"model": model.state_dict()}, ckpt_path)
-        print(f"Saved checkpoint to {ckpt_path}")
+            ckpt_path = Path(args.save_dir) / f"dit_cifar_epoch{epoch}.pt"
+            torch.save({"model": model.state_dict()}, ckpt_path)
+            print(f"Saved checkpoint to {ckpt_path}")
 
 
 if __name__ == "__main__":

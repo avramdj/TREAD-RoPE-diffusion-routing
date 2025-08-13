@@ -391,14 +391,15 @@ class DiT(nn.Module):
         num_steps: int = 50,
         class_labels: Int[Tensor, "batch"] | None = None,
         method: str = "rk4",
-    ) -> Float[Tensor, "batch 1 height width"]:
+    ) -> Float[Tensor, "batch in_channels height width"]:
         """Rectified Flow ODE sampling using torchdiffeq."""
 
         batch_size = num_images
-        channels = 1
+        channels = self.in_channels
         x1 = torch.randn(batch_size, channels, height, width, device=device)
         if class_labels is None:
-            class_labels = torch.randint(0, 10, (batch_size,), device=device)
+            num_classes = getattr(self.y_embedder, "num_classes", 10)
+            class_labels = torch.randint(0, int(num_classes), (batch_size,), device=device)
 
         eval_model = self.to(device).eval()
 
