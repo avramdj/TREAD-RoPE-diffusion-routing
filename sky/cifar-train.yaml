@@ -1,0 +1,11 @@
+resources:
+  cloud: runpod
+  accelerators: H100:1
+
+workdir: .
+
+setup: |
+  uv sync
+
+run: |
+  python examples/train_cifar.py --epochs 1000 --batch-size 1024
