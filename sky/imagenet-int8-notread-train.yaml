@@ -1,7 +1,6 @@
 resources:
   cloud: runpod
   accelerators: A100-80GB:1
-  autostop: 10m
 
 workdir: .
 
