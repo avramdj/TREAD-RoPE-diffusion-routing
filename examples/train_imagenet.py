@@ -92,6 +92,7 @@ class TrainingLogger:
         self.last_fid_images = 0
         self.last_imglog_images = 0
         self.last_ckpt_images = 0
+        self.real_logged_once = False
 
     def log_step(self, *, loss_value: float, lr: float, step: int, images_seen: int) -> None:
         wandb.log({
@@ -142,12 +143,10 @@ class TrainingLogger:
         real_added = 0
         for latents_eval, _ in self.train_loader:
             latents_eval = latents_eval.to(self.device)
-            decoded = self.vae.decode(latents_eval).sample  # [-1,1]
-            real = (decoded + 1.0) * 0.5
             real = torch.nn.functional.interpolate(
-                real, size=(299, 299), mode="bilinear", align_corners=False
+                decode_latents(latents_eval, self.vae), size=(299, 299), mode="bilinear", align_corners=False
             )
-            fid.update(real.clamp(0, 1), real=True)
+            fid.update(real, real=True)
             real_added += real.shape[0]
             if real_added >= self.fid_samples:
                 break
@@ -160,12 +159,10 @@ class TrainingLogger:
             x_t = self.ema_model.sample_ode_rectified_euler(
                 b, height=32, width=32, num_steps=self.timesteps, class_labels=y
             )
-            decoded_fake = self.vae.decode(x_t).sample
-            fake_01 = (decoded_fake + 1.0) * 0.5
             fake_for_fid = torch.nn.functional.interpolate(
-                fake_01, size=(299, 299), mode="bilinear", align_corners=False
+                decode_latents(x_t, self.vae), size=(299, 299), mode="bilinear", align_corners=False
             )
-            fid.update(fake_for_fid.clamp(0, 1), real=False)
+            fid.update(fake_for_fid, real=False)
             remain -= b
 
         fid_value = float(fid.compute().item())
@@ -184,8 +181,7 @@ class TrainingLogger:
         x_t = self.model.sample_ode_rectified_euler(
             num_images=b, height=32, width=32, num_steps=self.timesteps, class_labels=y
         )
-        decoded = self.vae.decode(x_t).sample
-        imgs = (decoded + 1.0) * 0.5
+        imgs = decode_latents(x_t, self.vae)
         grid = make_grid(
             imgs.detach().cpu()[: self.grid_n],
             nrow=int(math.sqrt(self.grid_n)),
@@ -198,8 +194,7 @@ class TrainingLogger:
         x_t_diffeq = self.model.sample_ode_rectified_diffeq(
             num_images=b, height=32, width=32, num_steps=self.timesteps, class_labels=y
         )
-        decoded_diffeq = self.vae.decode(x_t_diffeq).sample
-        imgs_diffeq = (decoded_diffeq + 1.0) * 0.5
+        imgs_diffeq = decode_latents(x_t_diffeq, self.vae)
         grid_diffeq = make_grid(
             imgs_diffeq.detach().cpu()[: self.grid_n],
             nrow=int(math.sqrt(self.grid_n)),
@@ -208,6 +203,23 @@ class TrainingLogger:
             value_range=(0, 1),
         )
         wandb.log({"viz/samples_grid_diffeq": wandb.Image(grid_diffeq), "step": step, "images_seen": images_seen})
+        # Also log a grid of ground-truth images decoded from real latents
+        if not self.real_logged_once:
+            try:
+                latents_real, _ = next(iter(self.train_loader))
+                latents_real = latents_real.to(self.device)
+                imgs_real = decode_latents(latents_real[: b], self.vae)
+                grid_real = make_grid(
+                    imgs_real.detach().cpu()[: self.grid_n],
+                    nrow=int(math.sqrt(self.grid_n)),
+                    padding=2,
+                    normalize=True,
+                    value_range=(0, 1),
+                )
+                wandb.log({"viz/samples_grid_real": wandb.Image(grid_real), "step": step, "images_seen": images_seen})
+                self.real_logged_once = True
+            except StopIteration:
+                pass
         # Restore RNG states
         torch.random.set_rng_state(cpu_state)
         if cuda_state is not None:
@@ -218,6 +230,9 @@ class TrainingLogger:
         torch.save({"model": self.model.state_dict(), "ema": self.ema_model.state_dict()}, ckpt_path)
         print(f"Saved checkpoint to {ckpt_path}")
 
+def decode_latents(latents: Tensor, vae: AutoencoderKL) -> Tensor:
+    # return ((vae.decode((latents / vae.config.scaling_factor).to(vae.dtype)).sample + 1.0) * 0.5).clamp(0, 1)
+    return ((vae.decode((latents).to(vae.dtype)).sample + 1.0) * 0.5).clamp(0, 1)
 
 def make_beta_schedule(num_steps: int, beta_start: float = 1e-4, beta_end: float = 2e-2) -> Tensor:
     betas = torch.linspace(beta_start, beta_end, num_steps, dtype=torch.float32)
@@ -263,7 +278,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train DiT on ImageNet.int8 latents (SDXL VAE)")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--timesteps", type=int, default=50)
     parser.add_argument("--rope", type=str, default="none", choices=["none", "axial", "golden_gate"])
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -281,6 +296,7 @@ def main() -> None:
     parser.add_argument("--dit-size", type=str, default="DiT-S/2", choices=DiT_models.keys())
     parser.add_argument("--start-block", type=int, default=2)
     parser.add_argument("--end-block", type=int, default=10)
+    parser.add_argument("--max-grad-norm", type=float, default=2.0)
     # ImageNet.int8 dataset paths
     parser.add_argument(
         "--inet-data",
@@ -411,7 +427,7 @@ def main() -> None:
 
     # LR warmup (5%) + linear decay to 0 by end
     total_steps = max(1, args.epochs * len(train_loader))
-    warmup_steps = max(1, int(0.05 * total_steps))
+    warmup_steps = max(1, int(0.04 * total_steps))
 
     def lr_lambda(step: int) -> float:
         step = step + 1
@@ -474,7 +490,7 @@ def main() -> None:
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.max_grad_norm)
             optimizer.step()
             ema_update(ema_model, model, args.ema_decay)
             scheduler.step()
