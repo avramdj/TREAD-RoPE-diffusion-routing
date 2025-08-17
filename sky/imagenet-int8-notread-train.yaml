@@ -29,5 +29,5 @@ run: |
     --log-images-every 240 \
     --log-fid-every -1 \
     --save-every 1200 \
-    --start-block 2 \
-    --end-block 10
+    --start-block -1 \
+    --end-block -1

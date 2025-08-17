@@ -73,6 +73,7 @@ class TrainingLogger:
         log_images_every_images: int,
         save_every_images: int,
         batch_size: int,
+        sample_seed: int,
     ) -> None:
         self.device = device
         self.vae = vae
@@ -87,6 +88,7 @@ class TrainingLogger:
         self.log_images_every_images = log_images_every_images
         self.save_every_images = save_every_images
         self.batch_size = batch_size
+        self.sample_seed = sample_seed
         self.last_fid_images = 0
         self.last_imglog_images = 0
         self.last_ckpt_images = 0
@@ -98,13 +100,13 @@ class TrainingLogger:
             "step": step,
             "images_seen": images_seen,
         })
-        if (images_seen - self.last_fid_images) >= self.log_fid_every_images:
+        if (images_seen - self.last_fid_images) >= self.log_fid_every_images and self.log_fid_every_images != -1:
             self._compute_and_log_fid(step=step, images_seen=images_seen)
             self.last_fid_images = images_seen
-        if (images_seen - self.last_imglog_images) >= self.log_images_every_images:
+        if (images_seen - self.last_imglog_images) >= self.log_images_every_images and self.log_images_every_images != -1:
             self._log_sample_images(step=step, images_seen=images_seen)
             self.last_imglog_images = images_seen
-        if (images_seen - self.last_ckpt_images) >= self.save_every_images:
+        if (images_seen - self.last_ckpt_images) >= self.save_every_images and self.save_every_images != -1:
             self._save_checkpoint(step=step, images_seen=images_seen)
             self.last_ckpt_images = images_seen
 
@@ -122,10 +124,17 @@ class TrainingLogger:
         fid_rem_imgs = max(0, (self.last_fid_images + self.log_fid_every_images) - images_seen)
         img_rem_imgs = max(0, (self.last_imglog_images + self.log_images_every_images) - images_seen)
         ckp_rem_imgs = max(0, (self.last_ckpt_images + self.save_every_images) - images_seen)
-        fid_steps = self._images_to_steps(fid_rem_imgs)
-        img_steps = self._images_to_steps(img_rem_imgs)
-        ckp_steps = self._images_to_steps(ckp_rem_imgs)
-        return f"seen {seen_str} | F {self._fmt_k(fid_steps)} | I {self._fmt_k(img_steps)} | C {self._fmt_k(ckp_steps)}"
+        fid_steps = self._images_to_steps(fid_rem_imgs) if self.log_fid_every_images != -1 else -1
+        img_steps = self._images_to_steps(img_rem_imgs) if self.log_images_every_images != -1 else -1
+        ckp_steps = self._images_to_steps(ckp_rem_imgs) if self.save_every_images != -1 else -1
+        ret = f"seen {seen_str}"
+        if self.log_fid_every_images != -1:
+            ret += f" | F {self._fmt_k(fid_steps)}"
+        if self.log_images_every_images != -1:
+            ret += f" | I {self._fmt_k(img_steps)}"
+        if self.save_every_images != -1:
+            ret += f" | C {self._fmt_k(ckp_steps)}"
+        return ret
 
     @torch.no_grad()
     def _compute_and_log_fid(self, *, step: int, images_seen: int) -> None:
@@ -165,6 +174,12 @@ class TrainingLogger:
     @torch.no_grad()
     def _log_sample_images(self, *, step: int, images_seen: int) -> None:
         b = self.grid_n
+        # Save and restore RNG state to keep sampling deterministic without affecting training RNG
+        cpu_state = torch.random.get_rng_state()
+        cuda_state = torch.cuda.get_rng_state(self.device) if self.device.type == "cuda" else None
+        torch.manual_seed(self.sample_seed)
+        if self.device.type == "cuda":
+            torch.cuda.manual_seed_all(self.sample_seed)
         y = torch.randint(0, 1000, (b,), device=self.device)
         x_t = self.model.sample_ode_rectified_euler(
             num_images=b, height=32, width=32, num_steps=self.timesteps, class_labels=y
@@ -193,6 +208,10 @@ class TrainingLogger:
             value_range=(0, 1),
         )
         wandb.log({"viz/samples_grid_diffeq": wandb.Image(grid_diffeq), "step": step, "images_seen": images_seen})
+        # Restore RNG states
+        torch.random.set_rng_state(cpu_state)
+        if cuda_state is not None:
+            torch.cuda.set_rng_state(cuda_state, self.device)
 
     def _save_checkpoint(self, *, step: int, images_seen: int) -> None:
         ckpt_path = self.save_dir / f"dit_imagenet_step{step}.pt"
@@ -252,13 +271,16 @@ def main() -> None:
     parser.add_argument("--save-dir", type=str, default="examples/checkpoints")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fid-samples", type=int, default=256)
-    # Step/image-based intervals (defaults scaled by batch size after parsing)
-    parser.add_argument("--log-fid-every", type=int, default=None)
-    parser.add_argument("--log-images-every", type=int, default=None)
-    parser.add_argument("--grid-n", type=int, default=4)
+    # Interval configuration
+    parser.add_argument("--log-fid-every", type=int, default=None, help="Interval value; unit set by --interval-unit")
+    parser.add_argument("--log-images-every", type=int, default=None, help="Interval value; unit set by --interval-unit")
+    parser.add_argument("--grid-n", type=int, default=16)
     parser.add_argument("--ema-decay", type=float, default=0.9999)
-    parser.add_argument("--save-every", type=int, default=None)
+    parser.add_argument("--save-every", type=int, default=None, help="Interval value; unit set by --interval-unit")
+    parser.add_argument("--interval-unit", type=str, choices=["steps", "images"], default="steps")
     parser.add_argument("--dit-size", type=str, default="DiT-S/2", choices=DiT_models.keys())
+    parser.add_argument("--start-block", type=int, default=2)
+    parser.add_argument("--end-block", type=int, default=10)
     # ImageNet.int8 dataset paths
     parser.add_argument(
         "--inet-data",
@@ -284,13 +306,25 @@ def main() -> None:
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
 
-    # Scale default intervals by batch size if not provided
-    if args.log_fid_every is None:
-        args.log_fid_every = 10000 * args.batch_size
-    if args.log_images_every is None:
-        args.log_images_every = 1000 * args.batch_size
-    if args.save_every is None:
-        args.save_every = 10000 * args.batch_size
+    # Resolve intervals: defaults in steps, convert to images if needed
+    default_fid_steps = 10000
+    default_img_steps = 1000
+    default_ckpt_steps = 10000
+    fid_steps = args.log_fid_every if args.log_fid_every is not None else default_fid_steps
+    img_steps = args.log_images_every if args.log_images_every is not None else default_img_steps
+    ckp_steps = args.save_every if args.save_every is not None else default_ckpt_steps
+    if args.interval_unit == "steps":
+        log_fid_every_images = fid_steps * args.batch_size if fid_steps != -1 else -1
+        log_images_every_images = img_steps * args.batch_size if img_steps != -1 else -1
+        save_every_images = ckp_steps * args.batch_size if ckp_steps != -1 else -1
+    else:
+        # provided values are in images; also compute step views for display
+        log_fid_every_images = fid_steps
+        log_images_every_images = img_steps
+        save_every_images = ckp_steps
+        fid_steps = int(math.ceil(fid_steps / float(max(1, args.batch_size)))) if fid_steps != -1 else -1
+        img_steps = int(math.ceil(img_steps / float(max(1, args.batch_size)))) if img_steps != -1 else -1
+        ckp_steps = int(math.ceil(ckp_steps / float(max(1, args.batch_size)))) if ckp_steps != -1 else -1
 
     # ImageNet.int8 latent dataset
     train_ds = ImageNetInt8LatentDataset(args.inet_data, args.inet_labels)
@@ -305,7 +339,7 @@ def main() -> None:
 
     # Small DiT (reasonable defaults)
     rope_arg = None if args.rope == "none" else args.rope
-    route_config = {"start_block": 2, "end_block": 10, "rate": 0.5, "mix_factor": 0.5}
+    route_config = {"start_block": args.start_block, "end_block": args.end_block, "rate": 0.5, "mix_factor": 0.5}
     model = DiT_models[args.dit_size](
         input_size=32,
         in_channels=4,  # SDXL latent channels
@@ -403,29 +437,28 @@ def main() -> None:
         timesteps=args.timesteps,
         fid_samples=args.fid_samples,
         save_dir=Path(args.save_dir),
-        log_fid_every_images=args.log_fid_every,
-        log_images_every_images=args.log_images_every,
-        save_every_images=args.save_every,
+        log_fid_every_images=log_fid_every_images,
+        log_images_every_images=log_images_every_images,
+        save_every_images=save_every_images,
         batch_size=args.batch_size,
+        sample_seed=1337,
     )
 
     # Print concise hook schedule (in steps)
     def fmt_k(val: int) -> str:
         return f"{val/1000.0:.2f}K" if val >= 1000 else f"{val}"
-    fid_steps = int(math.ceil(args.log_fid_every / float(max(1, args.batch_size))))
-    img_steps = int(math.ceil(args.log_images_every / float(max(1, args.batch_size))))
-    ckp_steps = int(math.ceil(args.save_every / float(max(1, args.batch_size))))
     print(
         f"Logging: FID every {fmt_k(fid_steps)} steps, "
         f"Images every {fmt_k(img_steps)} steps, "
         f"Ckpt every {fmt_k(ckp_steps)} steps. Batch={args.batch_size}"
     )
 
+    total_steps = args.epochs * len(train_loader)
+    pbar = tqdm(total=total_steps, desc=logger.format_status(images_seen), leave=True)
     for epoch in range(1, args.epochs + 1):
         running_loss = 0.0
         num_batches = 0
-        pbar = tqdm(train_loader, desc=logger.format_status(images_seen), leave=False)
-        for latents, labels in pbar:
+        for latents, labels in train_loader:
             latents = latents.to(device)
             labels = labels.to(device)
 
@@ -462,6 +495,8 @@ def main() -> None:
 
             # Update concise tqdm status
             pbar.set_description(logger.format_status(images_seen))
+            pbar.update(1)
+    pbar.close()
 
 
 if __name__ == "__main__":
