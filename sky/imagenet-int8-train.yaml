@@ -1,0 +1,26 @@
+resources:
+  cloud: runpod
+  accelerators: A100-80GB:1
+
+workdir: .
+
+secrets:
+  WANDB_API_KEY: null
+
+setup: |
+  uv sync
+  mkdir -p examples/data/imagenet_int8
+  if [ ! -f examples/data/imagenet_int8/inet.npy ]; then
+    wget -O examples/data/imagenet_int8/inet.npy "https://huggingface.co/ramimmo/mini.imgnet.int8/resolve/main/inet.npy"
+  fi
+  if [ ! -f examples/data/imagenet_int8/inet.json ]; then
+    wget -O examples/data/imagenet_int8/inet.json "https://huggingface.co/ramimmo/mini.imgnet.int8/resolve/main/inet.json"
+  fi
+
+run: |
+  DISABLE_JAX_TYPING=1 uv run python "examples/train_imagenet.py" \
+    --epochs 1000 \
+    --batch-size 1024 \
+    --inet-data examples/data/imagenet_int8/inet.npy \
+    --inet-labels examples/data/imagenet_int8/inet.json \
+    --dit-size DiT-B/4

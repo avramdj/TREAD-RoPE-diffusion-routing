@@ -5,7 +5,9 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "accelerate>=1.10.0",
     "beartype>=0.21.0",
+    "diffusers>=0.34.0",
     "jaxtyping>=0.3.2",
     "python-dotenv>=1.1.1",
     "ruff>=0.12.8",
@@ -15,6 +17,7 @@ dependencies = [
     "torchmetrics[image]>=1.8.1",
     "torchvision>=0.23.0",
     "tqdm>=4.67.1",
+    "transformers>=4.55.2",
     "wandb>=0.21.1",
 ]
 

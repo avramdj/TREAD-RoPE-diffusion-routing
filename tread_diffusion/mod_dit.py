@@ -381,27 +381,26 @@ class DiT(nn.Module):
         return torch.cat([eps, rest], dim=1)
 
     @typed
-    def sample_ode_rectified(
+    @torch.no_grad()
+    def sample_ode_rectified_diffeq(
         self,
         num_images: int,
         *,
         height: int,
         width: int,
-        device: torch.device,
         num_steps: int = 50,
         class_labels: Int[Tensor, "batch"] | None = None,
         method: str = "rk4",
     ) -> Float[Tensor, "batch in_channels height width"]:
         """Rectified Flow ODE sampling using torchdiffeq."""
-
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
         batch_size = num_images
         channels = self.in_channels
-        x1 = torch.randn(batch_size, channels, height, width, device=device)
+        x1 = torch.randn(batch_size, channels, height, width, device=device, dtype=torch.float32)
         if class_labels is None:
             num_classes = getattr(self.y_embedder, "num_classes", 10)
             class_labels = torch.randint(0, int(num_classes), (batch_size,), device=device)
-
-        eval_model = self.to(device).eval()
 
         class ODEFunc(nn.Module):
             def __init__(self, outer: DiT, labels: Tensor):
@@ -412,14 +411,47 @@ class DiT(nn.Module):
             def forward(self, t: Tensor, x: Tensor) -> Tensor:
                 t_vec = t.expand(x.shape[0]).to(x)
                 with torch.no_grad():
-                    v = eval_model(x, t_vec, self.labels)
+                    v = self.outer(x, t_vec, self.labels)
                 return -v
 
         func = ODEFunc(self, class_labels)
-        ts = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
+        ts = torch.linspace(1.0, 0.0, num_steps + 1, device=device, dtype=torch.float32)
         x_path = odeint(func, x1, ts, method=method)
         x0 = x_path[-1]
         return x0
+
+    @typed
+    @torch.no_grad()
+    def sample_ode_rectified_euler(
+        self,
+        num_images: int,
+        *,
+        height: int,
+        width: int,
+        num_steps: int = 50,
+        class_labels: Int[Tensor, "batch"] | None = None,
+    ) -> Float[Tensor, "batch in_channels height width"]:
+        """Rectified Flow ODE sampling using Euler's method."""
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
+        batch_size = num_images
+        channels = self.in_channels
+        x1 = torch.randn(batch_size, channels, height, width, device=device, dtype=torch.float32)
+        if class_labels is None:
+            num_classes = getattr(self.y_embedder, "num_classes", 10)
+            class_labels = torch.randint(0, int(num_classes), (batch_size,), device=device)
+
+        ts = torch.linspace(1.0, 0.0, steps=num_steps + 1, device=device, dtype=torch.float32)
+
+        for i in range(num_steps):
+            t_now = ts[i]
+            t_next = ts[i + 1]
+            dt = t_next - t_now
+            t_vec = t_now.expand(batch_size).to(dtype)
+            with torch.no_grad():
+                v: Tensor = self(x1.to(dtype), t_vec, class_labels).float()
+            x1 = x1 - v * dt
+        return x1
 
 
 @typed
