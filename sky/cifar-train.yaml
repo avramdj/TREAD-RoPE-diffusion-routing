@@ -4,8 +4,11 @@ resources:
 
 workdir: .
 
+secrets:
+  WANDB_API_KEY: null
+
 setup: |
   uv sync
 
 run: |
-  python examples/train_cifar.py --epochs 1000 --batch-size 1024
+  DISABLE_JAX_TYPING=1 uv run python examples/train_cifar.py --epochs 1000 --batch-size 1024
