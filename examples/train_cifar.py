@@ -134,7 +134,6 @@ def main() -> None:
         # Copy buffers (for completeness)
         for ema_buf, buf in zip(ema.buffers(), online.buffers()):
             ema_buf.copy_(buf)
-    
 
     # Compile and precision stuff
     from torch._inductor import config as inductor_config
@@ -142,7 +141,7 @@ def main() -> None:
     torch.set_float32_matmul_precision("high")
     inductor_config.triton.cudagraphs = False
     model = torch.compile(model, dynamic=True, fullgraph=False, mode="max-autotune-no-cudagraphs")
-    
+
     # RECTIFIED FLOW
 
     wandb_project = os.getenv("WANDB_PROJECT", "tread-diffusion-cifar10")
@@ -297,7 +296,7 @@ def main() -> None:
                     value_range=(0, 1),
                 )
                 wandb.log({"viz/samples_grid_diffeq": wandb.Image(grid_diffeq), "epoch": epoch})
-        
+
         if epoch % args.save_every == 0:
             ckpt_path = Path(args.save_dir) / f"dit_cifar_epoch{epoch}.pt"
             torch.save({"model": model.state_dict(), "ema": ema_model.state_dict()}, ckpt_path)

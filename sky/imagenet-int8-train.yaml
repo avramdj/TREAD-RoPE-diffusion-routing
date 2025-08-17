@@ -27,7 +27,7 @@ run: |
     --interval-unit steps \
     --log-images-every 500 \
     --log-fid-every -1 \
-    --save-every 10000 \
+    --save-every 500 \
     --start-block 2 \
     --end-block 10 \
     --grid-n 9

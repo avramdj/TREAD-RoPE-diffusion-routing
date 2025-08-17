@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import math
 import os
 from pathlib import Path
-import json
-import numpy as np
 
-from diffusers import AutoencoderKL
+import numpy as np
 import torch
 import torch.nn.functional as F
+from diffusers import AutoencoderKL
 from dotenv import load_dotenv
 from torch import Tensor
 from torch.optim import AdamW
@@ -23,6 +23,7 @@ from tqdm.auto import tqdm
 
 import wandb
 from tread_diffusion import DiT, DiT_models
+
 
 # Imagenet.int8: Entire Imagenet dataset in 5GB
 # See: https://github.com/SonicCodes/imagenet.int8 (shoutout to rami and simo)
@@ -39,9 +40,7 @@ class ImageNetInt8LatentDataset(torch.utils.data.Dataset):
         with open(labels_path, "r") as f:
             self.labels = json.load(f)
         num_samples = len(self.labels)
-        self.data = np.memmap(
-            data_path, dtype="uint8", mode="r", shape=(num_samples, 4096)
-        )
+        self.data = np.memmap(data_path, dtype="uint8", mode="r", shape=(num_samples, 4096))
 
     def __len__(self) -> int:
         return len(self.labels)
@@ -94,27 +93,38 @@ class TrainingLogger:
         self.last_ckpt_images = 0
         self.real_logged_once = False
 
-    def log_step(self, *, loss_value: float, lr: float, step: int, images_seen: int) -> None:
-        wandb.log({
-            "train/loss": loss_value,
-            "lr": lr,
-            "step": step,
-            "images_seen": images_seen,
-        })
-        if (images_seen - self.last_fid_images) >= self.log_fid_every_images and self.log_fid_every_images != -1:
+    def log_step(
+        self, *, loss_value: float, lr: float, step: int, images_seen: int, grad_norm: float
+    ) -> None:
+        wandb.log(
+            {
+                "train/loss": loss_value,
+                "lr": lr,
+                "step": step,
+                "images_seen": images_seen,
+                "grad_norm": grad_norm,
+            }
+        )
+        if (
+            images_seen - self.last_fid_images
+        ) >= self.log_fid_every_images and self.log_fid_every_images != -1:
             self._compute_and_log_fid(step=step, images_seen=images_seen)
             self.last_fid_images = images_seen
-        if (images_seen - self.last_imglog_images) >= self.log_images_every_images and self.log_images_every_images != -1:
+        if (
+            images_seen - self.last_imglog_images
+        ) >= self.log_images_every_images and self.log_images_every_images != -1:
             self._log_sample_images(step=step, images_seen=images_seen)
             self.last_imglog_images = images_seen
-        if (images_seen - self.last_ckpt_images) >= self.save_every_images and self.save_every_images != -1:
+        if (
+            images_seen - self.last_ckpt_images
+        ) >= self.save_every_images and self.save_every_images != -1:
             self._save_checkpoint(step=step, images_seen=images_seen)
             self.last_ckpt_images = images_seen
 
     @staticmethod
     def _fmt_k(value: float) -> str:
         if value >= 1000:
-            return f"{value/1000.0:.2f}K"
+            return f"{value / 1000.0:.2f}K"
         return f"{value:.0f}"
 
     def _images_to_steps(self, images: int) -> int:
@@ -144,7 +154,10 @@ class TrainingLogger:
         for latents_eval, _ in self.train_loader:
             latents_eval = latents_eval.to(self.device)
             real = torch.nn.functional.interpolate(
-                decode_latents(latents_eval, self.vae), size=(299, 299), mode="bilinear", align_corners=False
+                decode_latents(latents_eval, self.vae),
+                size=(299, 299),
+                mode="bilinear",
+                align_corners=False,
             )
             fid.update(real, real=True)
             real_added += real.shape[0]
@@ -202,13 +215,19 @@ class TrainingLogger:
             normalize=True,
             value_range=(0, 1),
         )
-        wandb.log({"viz/samples_grid_diffeq": wandb.Image(grid_diffeq), "step": step, "images_seen": images_seen})
+        wandb.log(
+            {
+                "viz/samples_grid_diffeq": wandb.Image(grid_diffeq),
+                "step": step,
+                "images_seen": images_seen,
+            }
+        )
         # Also log a grid of ground-truth images decoded from real latents
         if not self.real_logged_once:
             try:
                 latents_real, _ = next(iter(self.train_loader))
                 latents_real = latents_real.to(self.device)
-                imgs_real = decode_latents(latents_real[: b], self.vae)
+                imgs_real = decode_latents(latents_real[:b], self.vae)
                 grid_real = make_grid(
                     imgs_real.detach().cpu()[: self.grid_n],
                     nrow=int(math.sqrt(self.grid_n)),
@@ -216,7 +235,13 @@ class TrainingLogger:
                     normalize=True,
                     value_range=(0, 1),
                 )
-                wandb.log({"viz/samples_grid_real": wandb.Image(grid_real), "step": step, "images_seen": images_seen})
+                wandb.log(
+                    {
+                        "viz/samples_grid_real": wandb.Image(grid_real),
+                        "step": step,
+                        "images_seen": images_seen,
+                    }
+                )
                 self.real_logged_once = True
             except StopIteration:
                 pass
@@ -226,13 +251,15 @@ class TrainingLogger:
             torch.cuda.set_rng_state(cuda_state, self.device)
 
     def _save_checkpoint(self, *, step: int, images_seen: int) -> None:
-        ckpt_path = self.save_dir / f"dit_imagenet_step{step}.pt"
+        ckpt_path = self.save_dir / f"dit_imagenet_step-latest.pt"
         torch.save({"model": self.model.state_dict(), "ema": self.ema_model.state_dict()}, ckpt_path)
         print(f"Saved checkpoint to {ckpt_path}")
+
 
 def decode_latents(latents: Tensor, vae: AutoencoderKL) -> Tensor:
     # return ((vae.decode((latents / vae.config.scaling_factor).to(vae.dtype)).sample + 1.0) * 0.5).clamp(0, 1)
     return ((vae.decode((latents).to(vae.dtype)).sample + 1.0) * 0.5).clamp(0, 1)
+
 
 def make_beta_schedule(num_steps: int, beta_start: float = 1e-4, beta_end: float = 2e-2) -> Tensor:
     betas = torch.linspace(beta_start, beta_end, num_steps, dtype=torch.float32)
@@ -287,11 +314,17 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fid-samples", type=int, default=256)
     # Interval configuration
-    parser.add_argument("--log-fid-every", type=int, default=None, help="Interval value; unit set by --interval-unit")
-    parser.add_argument("--log-images-every", type=int, default=None, help="Interval value; unit set by --interval-unit")
+    parser.add_argument(
+        "--log-fid-every", type=int, default=None, help="Interval value; unit set by --interval-unit"
+    )
+    parser.add_argument(
+        "--log-images-every", type=int, default=None, help="Interval value; unit set by --interval-unit"
+    )
     parser.add_argument("--grid-n", type=int, default=16)
     parser.add_argument("--ema-decay", type=float, default=0.9999)
-    parser.add_argument("--save-every", type=int, default=None, help="Interval value; unit set by --interval-unit")
+    parser.add_argument(
+        "--save-every", type=int, default=None, help="Interval value; unit set by --interval-unit"
+    )
     parser.add_argument("--interval-unit", type=str, choices=["steps", "images"], default="steps")
     parser.add_argument("--dit-size", type=str, default="DiT-S/2", choices=DiT_models.keys())
     parser.add_argument("--start-block", type=int, default=2)
@@ -338,9 +371,15 @@ def main() -> None:
         log_fid_every_images = fid_steps
         log_images_every_images = img_steps
         save_every_images = ckp_steps
-        fid_steps = int(math.ceil(fid_steps / float(max(1, args.batch_size)))) if fid_steps != -1 else -1
-        img_steps = int(math.ceil(img_steps / float(max(1, args.batch_size)))) if img_steps != -1 else -1
-        ckp_steps = int(math.ceil(ckp_steps / float(max(1, args.batch_size)))) if ckp_steps != -1 else -1
+        fid_steps = (
+            int(math.ceil(fid_steps / float(max(1, args.batch_size)))) if fid_steps != -1 else -1
+        )
+        img_steps = (
+            int(math.ceil(img_steps / float(max(1, args.batch_size)))) if img_steps != -1 else -1
+        )
+        ckp_steps = (
+            int(math.ceil(ckp_steps / float(max(1, args.batch_size)))) if ckp_steps != -1 else -1
+        )
 
     # ImageNet.int8 latent dataset
     train_ds = ImageNetInt8LatentDataset(args.inet_data, args.inet_labels)
@@ -355,7 +394,12 @@ def main() -> None:
 
     # Small DiT (reasonable defaults)
     rope_arg = None if args.rope == "none" else args.rope
-    route_config = {"start_block": args.start_block, "end_block": args.end_block, "rate": 0.5, "mix_factor": 0.5}
+    route_config = {
+        "start_block": args.start_block,
+        "end_block": args.end_block,
+        "rate": 0.5,
+        "mix_factor": 0.5,
+    }
     model = DiT_models[args.dit_size](
         input_size=32,
         in_channels=4,  # SDXL latent channels
@@ -388,7 +432,6 @@ def main() -> None:
         # Copy buffers (for completeness)
         for ema_buf, buf in zip(ema.buffers(), online.buffers()):
             ema_buf.copy_(buf)
-    
 
     # Compile and precision stuff
     from torch._inductor import config as inductor_config
@@ -396,7 +439,7 @@ def main() -> None:
     torch.set_float32_matmul_precision("high")
     inductor_config.triton.cudagraphs = False
     model = torch.compile(model, dynamic=True, fullgraph=False, mode="max-autotune-no-cudagraphs")
-    
+
     # RECTIFIED FLOW
 
     wandb_project = os.getenv("WANDB_PROJECT", "tread-diffusion-imagenet-int8")
@@ -462,7 +505,8 @@ def main() -> None:
 
     # Print concise hook schedule (in steps)
     def fmt_k(val: int) -> str:
-        return f"{val/1000.0:.2f}K" if val >= 1000 else f"{val}"
+        return f"{val / 1000.0:.2f}K" if val >= 1000 else f"{val}"
+
     print(
         f"Logging: FID every {fmt_k(fid_steps)} steps, "
         f"Images every {fmt_k(img_steps)} steps, "
@@ -490,7 +534,7 @@ def main() -> None:
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.max_grad_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.max_grad_norm)
             optimizer.step()
             ema_update(ema_model, model, args.ema_decay)
             scheduler.step()
@@ -507,6 +551,7 @@ def main() -> None:
                 lr=optimizer.param_groups[0]["lr"],
                 step=global_step,
                 images_seen=images_seen,
+                grad_norm=grad_norm.item(),
             )
 
             # Update concise tqdm status
