@@ -324,41 +324,37 @@ class DiT(nn.Module):
             start_block = int(self.route_config["start_block"])  # type: ignore[index]
             end_block = int(self.route_config["end_block"])  # type: ignore[index]
             route_rate = float(self.route_config["rate"])  # type: ignore[index]
-            mix_factor = float(self.route_config.get("mix_factor", 0.5))
 
         for i, block in enumerate(self.blocks):
-            if not self.route_config:
-                x = block(x, c)
-                continue
-
-            if i < start_block or i > end_block:
+            if not self.route_config or i < start_block or i > end_block:
                 x = block(x, c)
                 continue
 
             if i == start_block and route_indices is None:
-                _, L, _ = x.shape
+                B, L, C = x.shape
                 num_to_route = max(1, int(L * route_rate))
-                idx = torch.randperm(L, device=x.device)
-                route_indices = idx[:num_to_route]
-                storage = x[:, route_indices, :].clone()
+                # shuffle L indices between batch
+                rand = torch.rand(B, L, device=x.device)
+                perms = rand.argsort(dim=1)
+                route_indices_BL = perms[:, num_to_route:]
+                route_indices_BLc = route_indices_BL.unsqueeze(-1)
+                non_route_indices_BL = perms[:, :num_to_route]
+                non_route_indices_BLc = non_route_indices_BL.unsqueeze(-1)
+                # storage is [B, num_to_route, C]
+                storage = torch.take_along_dim(x, route_indices_BLc, dim=1)
+                # x is [B, L - num_to_route, C]
+                x = torch.take_along_dim(x, non_route_indices_BLc, dim=1)
 
-            x_full = x
-            # Process block on full tokens
-            x_full = block(x_full, c)
+            x = block(x, c)
 
-            if i < end_block:
-                # Overwrite routed positions with cached tokens (bypass)
-                x_full = x_full.clone()
-                x_full[:, route_indices, :] = storage  # type: ignore[index]
-            else:
-                # end_block: mix back and clear
-                routed = x_full[:, route_indices, :]  # type: ignore[index]
-                mixed = mix_factor * routed + (1.0 - mix_factor) * storage  # type: ignore[operator]
-                x_full[:, route_indices, :] = mixed  # type: ignore[index]
-                storage = None
-                route_indices = None
+            if i == end_block:
+                out = torch.empty((B, L, C), device=x.device, dtype=x.dtype)
+                route_scatter_idx = route_indices_BLc.expand(-1, -1, C).long()
+                out.scatter_(1, route_scatter_idx, storage)
+                non_route_scatter_idx = non_route_indices_BLc.expand(-1, -1, C).long()
+                out.scatter_(1, non_route_scatter_idx, x)
+                x = out
 
-            x = x_full
         x = self.final_layer(x, c)
         x = self.unpatchify(x)
         return x

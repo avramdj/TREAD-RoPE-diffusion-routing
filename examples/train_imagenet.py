@@ -11,13 +11,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from diffusers import AutoencoderKL
+from diffusers.image_processor import VaeImageProcessor
 from dotenv import load_dotenv
 from torch import Tensor
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from torchmetrics.image.fid import FrechetInceptionDistance
-from torchvision import datasets, transforms
 from torchvision.utils import make_grid
 from tqdm.auto import tqdm
 
@@ -28,14 +28,6 @@ from tread_diffusion import DiT, DiT_models
 # Imagenet.int8: Entire Imagenet dataset in 5GB
 # See: https://github.com/SonicCodes/imagenet.int8 (shoutout to rami and simo)
 class ImageNetInt8LatentDataset(torch.utils.data.Dataset):
-    """
-    Memory-mapped ImageNet latents compressed to uint8 using SDXL VAE.
-    Each sample is 4096 bytes (4x32x32) stored as uint8.
-    Latents are dequantized to float32 using (x/255 - 0.5) * 24.0
-    and returned as shape [4, 32, 32].
-    Labels file is a JSON list of [label_index, label_text].
-    """
-
     def __init__(self, data_path: str, labels_path: str):
         with open(labels_path, "r") as f:
             self.labels = json.load(f)
@@ -94,7 +86,14 @@ class TrainingLogger:
         self.real_logged_once = False
 
     def log_step(
-        self, *, loss_value: float, lr: float, step: int, images_seen: int, grad_norm: float
+        self,
+        *,
+        loss_value: float,
+        lr: float,
+        step: int,
+        images_seen: int,
+        grad_norm: float,
+        post_clip_norm: float,
     ) -> None:
         wandb.log(
             {
@@ -103,6 +102,7 @@ class TrainingLogger:
                 "step": step,
                 "images_seen": images_seen,
                 "grad_norm": grad_norm,
+                "post_clip_norm": post_clip_norm,
             }
         )
         if (
@@ -251,34 +251,19 @@ class TrainingLogger:
             torch.cuda.set_rng_state(cuda_state, self.device)
 
     def _save_checkpoint(self, *, step: int, images_seen: int) -> None:
-        ckpt_path = self.save_dir / f"dit_imagenet_step-latest.pt"
+        ckpt_path = self.save_dir / "dit_imagenet_step-latest.pt"
         torch.save({"model": self.model.state_dict(), "ema": self.ema_model.state_dict()}, ckpt_path)
         print(f"Saved checkpoint to {ckpt_path}")
 
 
 def decode_latents(latents: Tensor, vae: AutoencoderKL) -> Tensor:
-    # return ((vae.decode((latents / vae.config.scaling_factor).to(vae.dtype)).sample + 1.0) * 0.5).clamp(0, 1)
-    return ((vae.decode((latents).to(vae.dtype)).sample + 1.0) * 0.5).clamp(0, 1)
-
-
-def make_beta_schedule(num_steps: int, beta_start: float = 1e-4, beta_end: float = 2e-2) -> Tensor:
-    betas = torch.linspace(beta_start, beta_end, num_steps, dtype=torch.float32)
-    return betas
-
-
-def precompute_alphas(betas: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-    alphas = 1.0 - betas
-    alphas_cumprod = torch.cumprod(alphas, dim=0)
-    sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
-    sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
-    return sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod, alphas
-
-
-@torch.no_grad()
-def q_sample(x0: Tensor, t: Tensor, noise: Tensor, sqrt_ac: Tensor, sqrt_1m_ac: Tensor) -> Tensor:
-    s1 = sqrt_ac.gather(0, t).view(-1, 1, 1, 1)
-    s2 = sqrt_1m_ac.gather(0, t).view(-1, 1, 1, 1)
-    return s1 * x0 + s2 * noise
+    # return ((vae.decode((latents).to(vae.dtype)).sample + 1.0) * 0.5).clamp(0, 1)
+    vae_sample = vae.decode((latents).to(vae.dtype)).sample
+    return VaeImageProcessor().postprocess(
+        image=vae_sample,
+        do_denormalize=[True] * vae_sample.shape[0],
+        output_type="pt",
+    )
 
 
 @torch.no_grad()
@@ -350,6 +335,7 @@ def main() -> None:
         default="stabilityai/sdxl-vae",
         help="Hugging Face id or local path for SDXL VAE",
     )
+    parser.add_argument("--wandb-name", type=str, default="tread-diffusion-imagenet-int8")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -409,7 +395,7 @@ def main() -> None:
         route_config=route_config,
     ).to(device)
 
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    optimizer = AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999))  # weight_decay=0.01)
 
     # EMA model (kept in eval mode)
     ema_model = DiT_models[args.dit_size](
@@ -445,6 +431,7 @@ def main() -> None:
     wandb_project = os.getenv("WANDB_PROJECT", "tread-diffusion-imagenet-int8")
     wandb.init(
         project=wandb_project,
+        name=args.wandb_name,
         config={
             "epochs": args.epochs,
             "batch_size": args.batch_size,
@@ -468,9 +455,9 @@ def main() -> None:
         else contextlib.nullcontext()
     )
 
-    # LR warmup (5%) + linear decay to 0 by end
+    # lr scheduler
     total_steps = max(1, args.epochs * len(train_loader))
-    warmup_steps = max(1, int(0.04 * total_steps))
+    warmup_steps = max(1, int(len(train_loader)))
 
     def lr_lambda(step: int) -> float:
         step = step + 1
@@ -482,7 +469,6 @@ def main() -> None:
     global_step = 0
     images_seen = 0
 
-    # Reuse a single VAE instance for decoding
     vae = AutoencoderKL.from_pretrained(args.vae).to(device)
     vae.eval()
 
@@ -535,6 +521,9 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.max_grad_norm)
+            post_clip_norm = torch.norm(
+                torch.stack([p.grad.norm(2) for p in model.parameters() if p.grad is not None]), 2
+            )
             optimizer.step()
             ema_update(ema_model, model, args.ema_decay)
             scheduler.step()
@@ -552,6 +541,7 @@ def main() -> None:
                 step=global_step,
                 images_seen=images_seen,
                 grad_norm=grad_norm.item(),
+                post_clip_norm=post_clip_norm.item(),
             )
 
             # Update concise tqdm status

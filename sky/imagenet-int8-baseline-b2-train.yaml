@@ -20,15 +20,15 @@ setup: |
 run: |
   DISABLE_JAX_TYPING=1 uv run python "examples/train_imagenet.py" \
     --epochs 150 \
-    --batch-size 2048 \
+    --batch-size 512 \
     --inet-data examples/data/imagenet_int8/inet.npy \
     --inet-labels examples/data/imagenet_int8/inet.json \
-    --dit-size DiT-B/4 \
+    --dit-size DiT-B/2 \
     --interval-unit steps \
-    --log-images-every 500 \
+    --log-images-every 1000 \
     --log-fid-every -1 \
-    --save-every 500 \
-    --start-block 2 \
-    --end-block 8 \
+    --save-every 1000 \
+    --start-block -1 \
+    --end-block -1 \
     --grid-n 9 \
-    --wandb-name "imagenet-int8-train"
+    --wandb-name "imagenet-int8-baseline-b2-train"

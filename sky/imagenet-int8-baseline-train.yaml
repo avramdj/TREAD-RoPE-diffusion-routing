@@ -30,4 +30,5 @@ run: |
     --save-every 500 \
     --start-block -1 \
     --end-block -1 \
-    --grid-n 9
+    --grid-n 9 \
+    --wandb-name "imagenet-int8-baseline-train"

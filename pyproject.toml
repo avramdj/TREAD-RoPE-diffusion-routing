@@ -42,6 +42,7 @@ include = ["tread_diffusion*"]
 
 [dependency-groups]
 dev = [
+    "ipykernel>=6.30.1",
     "pytest>=8.4.1",
     "ruff>=0.12.8",
 ]
