@@ -13,6 +13,8 @@ class RopeImpl(ABC, nn.Module):
 
 
 class GoldenGateRoPENd(RopeImpl):
+    "https://jerryxio.ng/posts/nd-rope/"
+
     def __init__(
         self,
         pos_dim: int,
