@@ -14,7 +14,7 @@ fi
 
 export WANDB_API_KEY=$WANDB_API_KEY
 
-for conf in imagenet-int8-train imagenet-int8-baseline-train; do
+for conf in imagenet-int8-b2-train ; do
     echo "Launching $conf"
-    sky launch -c $conf --secret WANDB_API_KEY $SCRIPT_DIR/$conf.yaml -y -d &
+    sky launch -c $conf --secret WANDB_API_KEY $SCRIPT_DIR/$conf.yaml -y --down -d "$@" &
 done
