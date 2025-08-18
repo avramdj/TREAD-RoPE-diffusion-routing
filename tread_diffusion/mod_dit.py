@@ -6,7 +6,6 @@ import torch.nn as nn
 from jaxtyping import Float, Int
 from timm.models.vision_transformer import Attention, Mlp, PatchEmbed
 from torch import Tensor
-from torchdiffeq import odeint
 
 from tread_diffusion.attention import FlexAttentionWithRoPE, RopeKind
 from tread_diffusion.typing import typed
@@ -234,11 +233,12 @@ class DiT(nn.Module):
         self.patch_size = patch_size
         self.num_heads = num_heads
         self.rope = rope
+        self.use_pos_embed = rope is None
         if self.rope is not None and self.rope not in FlexAttentionWithRoPE.ROPE_KINDS:
             raise ValueError("rope must be one of 'axial', 'golden_gate', or None")
 
         # Routing config with sane defaults
-        default_route = {"start_block": 2, "end_block": 24, "rate": 0.5}
+        default_route = {"start_block": -1, "end_block": -1, "rate": 0.5}
         self.route_config = (
             {**default_route, **{k: v for k, v in (route_config or {}).items() if v is not None}}
             if route_config is not None
@@ -247,7 +247,8 @@ class DiT(nn.Module):
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        self.y_embedder = LabelEmbedder(num_classes + 1, hidden_size, class_dropout_prob)
+        self.null_class = num_classes
         if rope is None:
             num_patches = self.x_embedder.num_patches
             self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
@@ -291,6 +292,14 @@ class DiT(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
+    def token_drop(self, labels, cond_drop_prob, force_drop_ids=None):
+        if force_drop_ids is None:
+            drop_ids = torch.rand(labels.shape[0], device=labels.device) < cond_drop_prob
+        else:
+            drop_ids = force_drop_ids == 1
+        labels = torch.where(drop_ids, self.null_class, labels)
+        return labels
+
     @typed
     def unpatchify(
         self, x: Float[Tensor, "batch num_patches unpatched_dim"]
@@ -313,17 +322,27 @@ class DiT(nn.Module):
         y: Int[Tensor, "batch"],
     ) -> Float[Tensor, "batch out_channels height width"]:
         x = self.x_embedder(x)
-        if self.rope is None:
+        if self.use_pos_embed:
             x = x + self.pos_embed
         t = self.t_embedder(t)
         y = self.y_embedder(y, self.training)
         c = t + y
+        x = self.route_through_blocks(x, c)
+        x = self.final_layer(x, c)
+        x = self.unpatchify(x)
+        return x
+
+    def route_through_blocks(self, x, c):
         storage = None
         route_indices = None
         if self.route_config:
             start_block = int(self.route_config["start_block"])  # type: ignore[index]
             end_block = int(self.route_config["end_block"])  # type: ignore[index]
             route_rate = float(self.route_config["rate"])  # type: ignore[index]
+        else:
+            start_block = -1
+            end_block = -1
+            route_rate = 0.0
 
         for i, block in enumerate(self.blocks):
             if not self.route_config or i < start_block or i > end_block:
@@ -354,100 +373,7 @@ class DiT(nn.Module):
                 non_route_scatter_idx = non_route_indices_BLc.expand(-1, -1, C).long()
                 out.scatter_(1, non_route_scatter_idx, x)
                 x = out
-
-        x = self.final_layer(x, c)
-        x = self.unpatchify(x)
         return x
-
-    @typed
-    def forward_with_cfg(
-        self,
-        x: Float[Tensor, "batch2 in_channels height width"],
-        t: Float[Tensor, "batch2"],
-        y: Int[Tensor, "batch2"],
-        cfg_scale: float,
-    ) -> Float[Tensor, "batch2 out_channels height width"]:
-        half = x[: len(x) // 2]
-        combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
-        eps, rest = model_out[:, :3], model_out[:, 3:]
-        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
-        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
-        eps = torch.cat([half_eps, half_eps], dim=0)
-        return torch.cat([eps, rest], dim=1)
-
-    @typed
-    @torch.no_grad()
-    def sample_ode_rectified_diffeq(
-        self,
-        num_images: int,
-        *,
-        height: int,
-        width: int,
-        num_steps: int = 50,
-        class_labels: Int[Tensor, "batch"] | None = None,
-        method: str = "rk4",
-    ) -> Float[Tensor, "batch in_channels height width"]:
-        """Rectified Flow ODE sampling using torchdiffeq."""
-        device = next(self.parameters()).device
-        dtype = next(self.parameters()).dtype
-        batch_size = num_images
-        channels = self.in_channels
-        x1 = torch.randn(batch_size, channels, height, width, device=device, dtype=torch.float32)
-        if class_labels is None:
-            num_classes = getattr(self.y_embedder, "num_classes", 10)
-            class_labels = torch.randint(0, int(num_classes), (batch_size,), device=device)
-
-        class ODEFunc(nn.Module):
-            def __init__(self, outer: DiT, labels: Tensor):
-                super().__init__()
-                self.outer = outer
-                self.labels = labels
-
-            def forward(self, t: Tensor, x: Tensor) -> Tensor:
-                t_vec = t.expand(x.shape[0]).to(x)
-                with torch.no_grad():
-                    v = self.outer(x, t_vec, self.labels)
-                return -v
-
-        func = ODEFunc(self, class_labels)
-        ts = torch.linspace(1.0, 0.0, num_steps + 1, device=device, dtype=torch.float32)
-        x_path = odeint(func, x1, ts, method=method)
-        x0 = x_path[-1]
-        return x0
-
-    @typed
-    @torch.no_grad()
-    def sample_ode_rectified_euler(
-        self,
-        num_images: int,
-        *,
-        height: int,
-        width: int,
-        num_steps: int = 50,
-        class_labels: Int[Tensor, "batch"] | None = None,
-    ) -> Float[Tensor, "batch in_channels height width"]:
-        """Rectified Flow ODE sampling using Euler's method."""
-        device = next(self.parameters()).device
-        dtype = next(self.parameters()).dtype
-        batch_size = num_images
-        channels = self.in_channels
-        x1 = torch.randn(batch_size, channels, height, width, device=device, dtype=torch.float32)
-        if class_labels is None:
-            num_classes = getattr(self.y_embedder, "num_classes", 10)
-            class_labels = torch.randint(0, int(num_classes), (batch_size,), device=device)
-
-        ts = torch.linspace(1.0, 0.0, steps=num_steps + 1, device=device, dtype=torch.float32)
-
-        for i in range(num_steps):
-            t_now = ts[i]
-            t_next = ts[i + 1]
-            dt = t_next - t_now
-            t_vec = t_now.expand(batch_size).to(dtype)
-            with torch.no_grad():
-                v: Tensor = self(x1.to(dtype), t_vec, class_labels).float()
-            x1 = x1 - v * dt
-        return x1
 
 
 @typed

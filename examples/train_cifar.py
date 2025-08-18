@@ -20,26 +20,7 @@ from tqdm.auto import tqdm
 
 import wandb
 from tread_diffusion import DiT, DiT_models
-
-
-def make_beta_schedule(num_steps: int, beta_start: float = 1e-4, beta_end: float = 2e-2) -> Tensor:
-    betas = torch.linspace(beta_start, beta_end, num_steps, dtype=torch.float32)
-    return betas
-
-
-def precompute_alphas(betas: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-    alphas = 1.0 - betas
-    alphas_cumprod = torch.cumprod(alphas, dim=0)
-    sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
-    sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
-    return sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod, alphas
-
-
-@torch.no_grad()
-def q_sample(x0: Tensor, t: Tensor, noise: Tensor, sqrt_ac: Tensor, sqrt_1m_ac: Tensor) -> Tensor:
-    s1 = sqrt_ac.gather(0, t).view(-1, 1, 1, 1)
-    s2 = sqrt_1m_ac.gather(0, t).view(-1, 1, 1, 1)
-    return s1 * x0 + s2 * noise
+from tread_diffusion.rectified_flow import RectifiedFlow
 
 
 @torch.no_grad()
@@ -52,12 +33,9 @@ def sample_model(
     height: int = 32,
     width: int = 32,
 ) -> Tensor:
-    return model.sample_ode_rectified_euler(
-        num_images,
-        height=height,
-        width=width,
-        num_steps=num_steps,
-        class_labels=classes.long() if classes is not None else None,
+    rf = RectifiedFlow(height=height, width=width, num_steps=num_steps)
+    return rf.sample_euler(
+        model=model, num_images=num_images, class_labels=classes.long() if classes is not None else None
     )
 
 
@@ -187,14 +165,9 @@ def main() -> None:
             images = images.to(device)
             labels = labels.to(device)
 
-            x1 = torch.randn_like(images)
-            t = torch.rand(images.shape[0], device=device)
-            x_t = (1.0 - t).view(-1, 1, 1, 1) * x1 + t.view(-1, 1, 1, 1) * images
-            v_target = images - x1
-
+            rf = RectifiedFlow(height=32, width=32, num_steps=args.timesteps)
             with amp_ctx:
-                pred_v = model(x_t, t, labels)
-                loss = F.mse_loss(pred_v, v_target)
+                loss = rf.loss(model, images, labels, amp_ctx)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -280,13 +253,8 @@ def main() -> None:
                 wandb.log({"viz/samples_grid": wandb.Image(grid), "epoch": epoch})
 
                 # Also log samples using the ODE rectified diffeq sampler
-                x_t_diffeq = model.sample_ode_rectified_diffeq(
-                    num_images=b,
-                    height=32,
-                    width=32,
-                    num_steps=args.timesteps,
-                    class_labels=y,
-                )
+                rf = RectifiedFlow(height=32, width=32, num_steps=args.timesteps)
+                x_t_diffeq = rf.sample_diffeq(model=model, num_images=b, class_labels=y)
                 imgs_diffeq = (x_t_diffeq + 1.0) * 0.5
                 grid_diffeq = make_grid(
                     imgs_diffeq.detach().cpu()[: args.grid_n],

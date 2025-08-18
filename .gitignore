@@ -1,3 +1,6 @@
+data/
+nohup.out
+logs/
 test.ipynb
 examples/checkpoints/
 examples/data/

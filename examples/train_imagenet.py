@@ -5,11 +5,11 @@ import contextlib
 import json
 import math
 import os
+from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from diffusers import AutoencoderKL
 from diffusers.image_processor import VaeImageProcessor
 from dotenv import load_dotenv
@@ -23,6 +23,7 @@ from tqdm.auto import tqdm
 
 import wandb
 from tread_diffusion import DiT, DiT_models
+from tread_diffusion.rectified_flow import RectifiedFlow
 
 
 # Imagenet.int8: Entire Imagenet dataset in 5GB
@@ -65,6 +66,7 @@ class TrainingLogger:
         save_every_images: int,
         batch_size: int,
         sample_seed: int,
+        rf: RectifiedFlow,
     ) -> None:
         self.device = device
         self.vae = vae
@@ -84,7 +86,7 @@ class TrainingLogger:
         self.last_imglog_images = 0
         self.last_ckpt_images = 0
         self.real_logged_once = False
-
+        self.rf = rf
     def log_step(
         self,
         *,
@@ -169,9 +171,7 @@ class TrainingLogger:
         while remain > 0:
             b = min(remain, n)
             y = torch.randint(0, 1000, (b,), device=self.device)
-            x_t = self.ema_model.sample_ode_rectified_euler(
-                b, height=32, width=32, num_steps=self.timesteps, class_labels=y
-            )
+            x_t = self.rf.sample_euler(num_images=b, model=self.ema_model, class_labels=y)
             fake_for_fid = torch.nn.functional.interpolate(
                 decode_latents(x_t, self.vae), size=(299, 299), mode="bilinear", align_corners=False
             )
@@ -190,38 +190,28 @@ class TrainingLogger:
         torch.manual_seed(self.sample_seed)
         if self.device.type == "cuda":
             torch.cuda.manual_seed_all(self.sample_seed)
-        y = torch.randint(0, 1000, (b,), device=self.device)
-        x_t = self.model.sample_ode_rectified_euler(
-            num_images=b, height=32, width=32, num_steps=self.timesteps, class_labels=y
-        )
-        imgs = decode_latents(x_t, self.vae)
-        grid = make_grid(
-            imgs.detach().cpu()[: self.grid_n],
-            nrow=int(math.sqrt(self.grid_n)),
-            padding=2,
-            normalize=True,
-            value_range=(0, 1),
-        )
-        wandb.log({"viz/samples_grid": wandb.Image(grid), "step": step, "images_seen": images_seen})
 
-        x_t_diffeq = self.model.sample_ode_rectified_diffeq(
-            num_images=b, height=32, width=32, num_steps=self.timesteps, class_labels=y
+        def log_grid(tag: str, imgs: Tensor) -> None:
+            grid = make_grid(
+                imgs.detach().cpu()[: self.grid_n],
+                nrow=int(math.sqrt(self.grid_n)),
+                padding=2,
+                normalize=True,
+                value_range=(0, 1),
+            )
+            wandb.log({tag: wandb.Image(grid), "step": step, "images_seen": images_seen})
+
+        y = torch.randint(0, 1000, (b,), device=self.device)
+        imgs = decode_latents(self.rf.sample_euler(num_images=b, model=self.model, class_labels=y), self.vae)
+        log_grid("viz/samples_grid", imgs)
+        imgs_diffeq = decode_latents(
+            rf.sample_euler(num_images=b, model=self.model, class_labels=y, cfg_scale=3.0), self.vae
         )
-        imgs_diffeq = decode_latents(x_t_diffeq, self.vae)
-        grid_diffeq = make_grid(
-            imgs_diffeq.detach().cpu()[: self.grid_n],
-            nrow=int(math.sqrt(self.grid_n)),
-            padding=2,
-            normalize=True,
-            value_range=(0, 1),
+        log_grid("viz/samples_grid_cfg_3.0", imgs_diffeq)
+        imgs_ema = decode_latents(
+            rf.sample_euler(num_images=b, model=self.ema_model, class_labels=y), self.vae
         )
-        wandb.log(
-            {
-                "viz/samples_grid_diffeq": wandb.Image(grid_diffeq),
-                "step": step,
-                "images_seen": images_seen,
-            }
-        )
+        log_grid("viz/samples_grid_ema", imgs_ema)
         # Also log a grid of ground-truth images decoded from real latents
         if not self.real_logged_once:
             try:
@@ -251,7 +241,7 @@ class TrainingLogger:
             torch.cuda.set_rng_state(cuda_state, self.device)
 
     def _save_checkpoint(self, *, step: int, images_seen: int) -> None:
-        ckpt_path = self.save_dir / "dit_imagenet_step-latest.pt"
+        ckpt_path = self.save_dir / "dit_imagenet-latest.pt"
         torch.save({"model": self.model.state_dict(), "ema": self.ema_model.state_dict()}, ckpt_path)
         print(f"Saved checkpoint to {ckpt_path}")
 
@@ -263,25 +253,6 @@ def decode_latents(latents: Tensor, vae: AutoencoderKL) -> Tensor:
         image=vae_sample,
         do_denormalize=[True] * vae_sample.shape[0],
         output_type="pt",
-    )
-
-
-@torch.no_grad()
-def sample_model(
-    model: DiT,
-    *,
-    num_images: int,
-    num_steps: int,
-    classes: Tensor | None = None,
-    height: int = 32,
-    width: int = 32,
-) -> Tensor:
-    return model.sample_ode_rectified_euler(
-        num_images,
-        height=height,
-        width=width,
-        num_steps=num_steps,
-        class_labels=classes.long() if classes is not None else None,
     )
 
 
@@ -386,45 +357,46 @@ def main() -> None:
         "rate": 0.5,
         "mix_factor": 0.5,
     }
-    model = DiT_models[args.dit_size](
-        input_size=32,
-        in_channels=4,  # SDXL latent channels
-        num_classes=1000,
-        learn_sigma=False,
-        rope=rope_arg,
-        route_config=route_config,
-    ).to(device)
+    dit_args = {
+        "input_size": 32,
+        "in_channels": 4,  # SDXL latent channels
+        "num_classes": 1000,
+        "learn_sigma": False,
+        "rope": rope_arg,
+        "route_config": route_config,
+    }
+    model = DiT_models[args.dit_size](**dit_args).to(device)
 
-    optimizer = AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999))  # weight_decay=0.01)
+    optimizer = AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=0.01)
 
     # EMA model (kept in eval mode)
-    ema_model = DiT_models[args.dit_size](
-        input_size=32,
-        in_channels=4,
-        num_classes=1000,
-        learn_sigma=False,
-        rope=rope_arg,
-        route_config=route_config,
-    ).to(device)
+    ema_model = DiT_models[args.dit_size](**dit_args).to(device)
     ema_model.load_state_dict(model.state_dict())
     ema_model.eval()
     for p in ema_model.parameters():
         p.requires_grad_(False)
 
     @torch.no_grad()
-    def ema_update(ema: DiT, online: DiT, decay: float) -> None:
-        for ema_p, p in zip(ema.parameters(), online.parameters()):
-            ema_p.data.mul_(decay).add_(p.data, alpha=1.0 - decay)
-        # Copy buffers (for completeness)
-        for ema_buf, buf in zip(ema.buffers(), online.buffers()):
-            ema_buf.copy_(buf)
+    def ema_update(ema: DiT, online: DiT, decay: float, compiled: bool = True) -> None:
+        ema_params = OrderedDict(ema.named_parameters())
+        online_params = OrderedDict(online.named_parameters())
+        for name, param in online_params.items():
+            if param.requires_grad:
+                ema_name = name.replace("_orig_mod.", "") if compiled else name
+                ema_params[ema_name].mul_(decay).add_(online_params[name].data, alpha=1 - decay)
 
     # Compile and precision stuff
     from torch._inductor import config as inductor_config
 
     torch.set_float32_matmul_precision("high")
     inductor_config.triton.cudagraphs = False
-    model = torch.compile(model, dynamic=True, fullgraph=False, mode="max-autotune-no-cudagraphs")
+    model = torch.compile(
+        model,
+        disable=os.getenv("DISABLE_TORCH_COMPILE", "0").lower() in ["1", "true", "yes"],
+        dynamic=True,
+        fullgraph=False,
+        mode="max-autotune-no-cudagraphs",
+    )
 
     # RECTIFIED FLOW
 
@@ -448,7 +420,9 @@ def main() -> None:
     model.train()
     Path(args.save_dir).mkdir(parents=True, exist_ok=True)
 
-    use_amp = device.type == "cuda" and torch.cuda.is_bf16_supported()
+    if device.type == "cuda":
+        assert torch.cuda.is_bf16_supported(), "bf16 is not supported on this GPU broke boy"
+    use_amp = device.type == "cuda"
     amp_ctx = (
         torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         if use_amp
@@ -472,6 +446,13 @@ def main() -> None:
     vae = AutoencoderKL.from_pretrained(args.vae).to(device)
     vae.eval()
 
+    rf = RectifiedFlow(
+        height=32,
+        width=32,
+        num_steps=args.timesteps,
+        vae_scaling_factor=vae.config.scaling_factor,
+    )
+
     logger = TrainingLogger(
         device=device,
         vae=vae,
@@ -487,6 +468,7 @@ def main() -> None:
         save_every_images=save_every_images,
         batch_size=args.batch_size,
         sample_seed=1337,
+        rf=rf,
     )
 
     # Print concise hook schedule (in steps)
@@ -508,17 +490,9 @@ def main() -> None:
             latents = latents.to(device)
             labels = labels.to(device)
 
-            # Rectified flow in latent space
-            x1 = torch.randn_like(latents)
-            t = torch.rand(latents.shape[0], device=device)
-            x_t = (1.0 - t).view(-1, 1, 1, 1) * x1 + t.view(-1, 1, 1, 1) * latents
-            v_target = latents - x1
+            loss = rf.loss(model, latents, labels, amp_ctx=amp_ctx)
 
-            with amp_ctx:
-                pred_v = model(x_t, t, labels)
-                loss = F.mse_loss(pred_v, v_target)
-
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad()
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.max_grad_norm)
             post_clip_norm = torch.norm(
