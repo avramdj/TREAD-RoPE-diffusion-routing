@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 from dotenv import load_dotenv
 from torch import Tensor
 from torch.optim import AdamW

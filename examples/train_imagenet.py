@@ -87,6 +87,7 @@ class TrainingLogger:
         self.last_ckpt_images = 0
         self.real_logged_once = False
         self.rf = rf
+
     def log_step(
         self,
         *,
@@ -202,14 +203,17 @@ class TrainingLogger:
             wandb.log({tag: wandb.Image(grid), "step": step, "images_seen": images_seen})
 
         y = torch.randint(0, 1000, (b,), device=self.device)
-        imgs = decode_latents(self.rf.sample_euler(num_images=b, model=self.model, class_labels=y), self.vae)
+        imgs = decode_latents(
+            self.rf.sample_euler(num_images=b, model=self.model, class_labels=y), self.vae
+        )
         log_grid("viz/samples_grid", imgs)
         imgs_diffeq = decode_latents(
-            rf.sample_euler(num_images=b, model=self.model, class_labels=y, cfg_scale=3.0), self.vae
+            self.rf.sample_euler(num_images=b, model=self.model, class_labels=y, cfg_scale=3.0),
+            self.vae,
         )
         log_grid("viz/samples_grid_cfg_3.0", imgs_diffeq)
         imgs_ema = decode_latents(
-            rf.sample_euler(num_images=b, model=self.ema_model, class_labels=y), self.vae
+            self.rf.sample_euler(num_images=b, model=self.ema_model, class_labels=y), self.vae
         )
         log_grid("viz/samples_grid_ema", imgs_ema)
         # Also log a grid of ground-truth images decoded from real latents
