@@ -208,10 +208,14 @@ class TrainingLogger:
         )
         log_grid("viz/samples_grid", imgs)
         imgs_diffeq = decode_latents(
+            self.rf.sample_diffeq(num_images=b, model=self.model, class_labels=y), self.vae
+        )
+        log_grid("viz/samples_grid_diffeq", imgs_diffeq)
+        imgs_cfg = decode_latents(
             self.rf.sample_euler(num_images=b, model=self.model, class_labels=y, cfg_scale=3.0),
             self.vae,
         )
-        log_grid("viz/samples_grid_cfg_3.0", imgs_diffeq)
+        log_grid("viz/samples_grid_cfg_3.0", imgs_cfg)
         imgs_ema = decode_latents(
             self.rf.sample_euler(num_images=b, model=self.ema_model, class_labels=y), self.vae
         )
