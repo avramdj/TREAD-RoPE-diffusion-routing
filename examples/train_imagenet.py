@@ -67,6 +67,7 @@ class TrainingLogger:
         batch_size: int,
         sample_seed: int,
         rf: RectifiedFlow,
+        save_name: str,
     ) -> None:
         self.device = device
         self.vae = vae
@@ -87,6 +88,7 @@ class TrainingLogger:
         self.last_ckpt_images = 0
         self.real_logged_once = False
         self.rf = rf
+        self.save_name = save_name
 
     def log_step(
         self,
@@ -485,6 +487,7 @@ def main() -> None:
         batch_size=args.batch_size,
         sample_seed=1337,
         rf=rf,
+        save_name=args.save_name,
     )
 
     # Print concise hook schedule (in steps)
