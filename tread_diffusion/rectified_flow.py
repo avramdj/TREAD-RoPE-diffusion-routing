@@ -60,6 +60,9 @@ class RectifiedFlow:
         apg: bool = False,
     ) -> Float[Tensor, "batch in_channels height width"]:
         """Rectified Flow ODE sampling using torchdiffeq."""
+        orig_route_config = model.route_config
+        model.route_config = None
+
         null_class = model.null_class
         height = height or self.height
         width = width or self.width
@@ -119,6 +122,7 @@ class RectifiedFlow:
         ts = torch.linspace(0.0, 1.0, num_steps + 1, device=device, dtype=torch.float32)
         x_path = odeint(func, x1, ts, method=method)
         x0 = x_path[-1]
+        model.route_config = orig_route_config
         return x0 / self.vae_scaling_factor
 
     @typed
@@ -136,6 +140,9 @@ class RectifiedFlow:
         apg: bool = False,
     ) -> Float[Tensor, "batch in_channels height width"]:
         """Rectified Flow ODE sampling using explicit Euler integration."""
+        orig_route_config = model.route_config
+        model.route_config = None
+
         null_class = model.null_class
         height = height or self.height
         width = width or self.width
@@ -176,4 +183,5 @@ class RectifiedFlow:
                     dd = v_pred - vnull
                     v_pred = v_pred + cfg_scale * dd
             x1 = x1 + v_pred * dt
+        model.route_config = orig_route_config
         return x1 / self.vae_scaling_factor
