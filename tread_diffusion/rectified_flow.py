@@ -97,7 +97,7 @@ class RectifiedFlow:
                     if self.null_labels is not None and self.cfg_scale is not None:
                         vnull = self.outer(x, t_vec, self.null_labels)
                         v = v + self.cfg_scale * (v - vnull)
-                return -v
+                return v
 
         if null_class is not None and cfg_scale is not None:
             null_labels = torch.full_like(class_labels, null_class)
@@ -105,7 +105,7 @@ class RectifiedFlow:
             null_labels = None
 
         func = ODEFunc(model, class_labels, null_labels, cfg_scale)
-        ts = torch.linspace(1.0, 0.0, num_steps + 1, device=device, dtype=torch.float32)
+        ts = torch.linspace(0.0, 1.0, num_steps + 1, device=device, dtype=torch.float32)
         x_path = odeint(func, x1, ts, method=method)
         x0 = x_path[-1]
         return x0 / self.vae_scaling_factor
@@ -146,7 +146,7 @@ class RectifiedFlow:
         else:
             null_labels = None
 
-        ts = torch.linspace(1.0, 0.0, steps=num_steps + 1, device=device, dtype=torch.float32)
+        ts = torch.linspace(0.0, 1.0, steps=num_steps + 1, device=device, dtype=torch.float32)
 
         for i in range(num_steps):
             t_now = ts[i]
@@ -157,5 +157,5 @@ class RectifiedFlow:
             if null_labels is not None and cfg_scale is not None:
                 vnull = model(x1.to(torch.float32), t_vec, null_labels).float()
                 v_pred = v_pred + cfg_scale * (v_pred - vnull)
-            x1 = x1 - v_pred * dt
+            x1 = x1 + v_pred * dt
         return x1 / self.vae_scaling_factor
