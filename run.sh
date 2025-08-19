@@ -29,6 +29,7 @@ nohup uv run python "examples/train_imagenet.py" \
   --end-block 8 \
   --grid-n 16 \
   --wandb-name "${DIT_SIZE_NAME}" "$@" \
+  --save-name "dit-b2-tread" \
   > ${LOG_FILE} 2>&1 &
 
 disown
