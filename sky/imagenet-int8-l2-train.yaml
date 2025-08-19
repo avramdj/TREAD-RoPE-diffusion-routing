@@ -1,7 +1,6 @@
 resources:
   cloud: runpod
-  # accelerators: A100-80GB:1
-  accelerators: H100:1
+  accelerators: A100-80GB:1
 
 workdir: .
 
@@ -21,7 +20,7 @@ setup: |
 run: |
   DISABLE_JAX_TYPING=1 uv run python "examples/train_imagenet.py" \
     --epochs 150 \
-    --batch-size 512 \
+    --batch-size 256 \
     --inet-data examples/data/imagenet_int8/inet.npy \
     --inet-labels examples/data/imagenet_int8/inet.json \
     --dit-size DiT-L/2 \
@@ -31,5 +30,5 @@ run: |
     --save-every 1000 \
     --start-block 2 \
     --end-block 20 \
-    --grid-n 9 \
+    --grid-n 16 \
     --wandb-name "DiT-L/2"
