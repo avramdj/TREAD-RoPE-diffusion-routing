@@ -27,7 +27,7 @@ nohup uv run python "examples/train_imagenet.py" \
   --save-every 1000 \
   --start-block 2 \
   --end-block 8 \
-  --grid-n 9 \
+  --grid-n 16 \
   --wandb-name "${DIT_SIZE_NAME}" "$@" \
   > ${LOG_FILE} 2>&1 &
 

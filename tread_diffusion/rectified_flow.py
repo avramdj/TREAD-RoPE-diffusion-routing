@@ -7,6 +7,7 @@ from jaxtyping import Float, Int
 from torch import Tensor
 from torchdiffeq import odeint
 
+from tread_diffusion.apg import MomentumBuffer, adaptive_projected_guidance
 from tread_diffusion.typing import typed
 
 
@@ -56,6 +57,7 @@ class RectifiedFlow:
         class_labels: Int[Tensor, "batch"] | None = None,
         method: str | None = None,
         cfg_scale: float | None = None,
+        apg: bool = False,
     ) -> Float[Tensor, "batch in_channels height width"]:
         """Rectified Flow ODE sampling using torchdiffeq."""
         null_class = model.null_class
@@ -83,12 +85,15 @@ class RectifiedFlow:
                 labels: Tensor,
                 null_labels: Tensor | None,
                 cfg_scale: float | None,
+                apg: bool,
             ):
                 super().__init__()
                 self.outer = outer
                 self.labels = labels
                 self.null_labels = null_labels
                 self.cfg_scale = cfg_scale
+                self.apg = apg
+                self.momentum_buffer = MomentumBuffer()
 
             def forward(self, t: Tensor, x: Tensor) -> Tensor:
                 t_vec = t.expand(x.shape[0]).to(x)
@@ -96,7 +101,13 @@ class RectifiedFlow:
                     v = self.outer(x, t_vec, self.labels)
                     if self.null_labels is not None and self.cfg_scale is not None:
                         vnull = self.outer(x, t_vec, self.null_labels)
-                        v = v + self.cfg_scale * (v - vnull)
+                        if self.apg:
+                            v = adaptive_projected_guidance(
+                                v, vnull, self.cfg_scale, self.momentum_buffer
+                            )
+                        else:
+                            dd = v - vnull
+                            v = v + self.cfg_scale * dd
                 return v
 
         if null_class is not None and cfg_scale is not None:
@@ -104,7 +115,7 @@ class RectifiedFlow:
         else:
             null_labels = None
 
-        func = ODEFunc(model, class_labels, null_labels, cfg_scale)
+        func = ODEFunc(model, class_labels, null_labels, cfg_scale, apg)
         ts = torch.linspace(0.0, 1.0, num_steps + 1, device=device, dtype=torch.float32)
         x_path = odeint(func, x1, ts, method=method)
         x0 = x_path[-1]
@@ -122,6 +133,7 @@ class RectifiedFlow:
         num_steps: int | None = None,
         class_labels: Int[Tensor, "batch"] | None = None,
         cfg_scale: float | None = None,
+        apg: bool = False,
     ) -> Float[Tensor, "batch in_channels height width"]:
         """Rectified Flow ODE sampling using explicit Euler integration."""
         null_class = model.null_class
@@ -148,6 +160,8 @@ class RectifiedFlow:
 
         ts = torch.linspace(0.0, 1.0, steps=num_steps + 1, device=device, dtype=torch.float32)
 
+        momentum_buffer = MomentumBuffer()
+
         for i in range(num_steps):
             t_now = ts[i]
             t_next = ts[i + 1]
@@ -156,6 +170,10 @@ class RectifiedFlow:
             v_pred = model(x1.to(torch.float32), t_vec, class_labels).float()
             if null_labels is not None and cfg_scale is not None:
                 vnull = model(x1.to(torch.float32), t_vec, null_labels).float()
-                v_pred = v_pred + cfg_scale * (v_pred - vnull)
+                if apg:
+                    v_pred = adaptive_projected_guidance(v_pred, vnull, cfg_scale, momentum_buffer)
+                else:
+                    dd = v_pred - vnull
+                    v_pred = v_pred + cfg_scale * dd
             x1 = x1 + v_pred * dt
         return x1 / self.vae_scaling_factor

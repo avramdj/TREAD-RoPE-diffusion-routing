@@ -206,20 +206,27 @@ class TrainingLogger:
         imgs = decode_latents(
             self.rf.sample_euler(num_images=b, model=self.model, class_labels=y), self.vae
         )
-        log_grid("viz/samples_grid", imgs)
+        log_grid("viz/euler", imgs)
         imgs_diffeq = decode_latents(
             self.rf.sample_diffeq(num_images=b, model=self.model, class_labels=y), self.vae
         )
-        log_grid("viz/samples_grid_diffeq", imgs_diffeq)
+        log_grid("viz/diffeq", imgs_diffeq)
         imgs_cfg = decode_latents(
             self.rf.sample_euler(num_images=b, model=self.model, class_labels=y, cfg_scale=3.0),
             self.vae,
         )
-        log_grid("viz/samples_grid_cfg_3.0", imgs_cfg)
+        log_grid("viz/diffeq_cfg_3", imgs_cfg)
+        imgs_cfg = decode_latents(
+            self.rf.sample_diffeq(
+                num_images=b, model=self.model, class_labels=y, cfg_scale=3.0, apg=True
+            ),
+            self.vae,
+        )
+        log_grid("viz/diffeq_cfg_3_apg", imgs_cfg)
         imgs_ema = decode_latents(
             self.rf.sample_euler(num_images=b, model=self.ema_model, class_labels=y), self.vae
         )
-        log_grid("viz/samples_grid_ema", imgs_ema)
+        log_grid("viz/ema", imgs_ema)
         # Also log a grid of ground-truth images decoded from real latents
         if not self.real_logged_once:
             try:
@@ -235,7 +242,7 @@ class TrainingLogger:
                 )
                 wandb.log(
                     {
-                        "viz/samples_grid_real": wandb.Image(grid_real),
+                        "viz/real": wandb.Image(grid_real),
                         "step": step,
                         "images_seen": images_seen,
                     }
@@ -249,7 +256,7 @@ class TrainingLogger:
             torch.cuda.set_rng_state(cuda_state, self.device)
 
     def _save_checkpoint(self, *, step: int, images_seen: int) -> None:
-        ckpt_path = self.save_dir / "dit_imagenet-latest.pt"
+        ckpt_path = self.save_dir / f"{self.save_name}.pt"
         torch.save({"model": self.model.state_dict(), "ema": self.ema_model.state_dict()}, ckpt_path)
         print(f"Saved checkpoint to {ckpt_path}")
 
@@ -315,6 +322,7 @@ def main() -> None:
         help="Hugging Face id or local path for SDXL VAE",
     )
     parser.add_argument("--wandb-name", type=str, default="tread-diffusion-imagenet-int8")
+    parser.add_argument("--save-name", type=str, default="dit-latest")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -375,7 +383,7 @@ def main() -> None:
     }
     model = DiT_models[args.dit_size](**dit_args).to(device)
 
-    optimizer = AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=0.01)
+    optimizer = AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=0.001)
 
     # EMA model (kept in eval mode)
     ema_model = DiT_models[args.dit_size](**dit_args).to(device)

@@ -8,6 +8,7 @@ dependencies = [
     "accelerate>=1.10.0",
     "beartype>=0.21.0",
     "diffusers>=0.34.0",
+    "einops>=0.8.1",
     "jaxtyping>=0.3.2",
     "python-dotenv>=1.1.1",
     "ruff>=0.12.8",
