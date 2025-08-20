@@ -286,6 +286,7 @@ def main() -> None:
     parser.add_argument("--save-dir", type=str, default="examples/checkpoints")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fid-samples", type=int, default=256)
+    parser.add_argument("--grad-accum", type=int, default=1, help="Gradient accumulation steps")
     # Interval configuration
     parser.add_argument(
         "--log-fid-every", type=int, default=None, help="Interval value; unit set by --interval-unit"
@@ -325,6 +326,9 @@ def main() -> None:
     )
     parser.add_argument("--wandb-name", type=str, default="tread-diffusion-imagenet-int8")
     parser.add_argument("--save-name", type=str, default="dit-latest")
+    parser.add_argument(
+        "--ckpt", type=str, default=None, help="Path to checkpoint .pt to load (optional)"
+    )
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -394,6 +398,26 @@ def main() -> None:
     for p in ema_model.parameters():
         p.requires_grad_(False)
 
+    # Optionally load checkpoint BEFORE compile to avoid _orig_mod key mismatch
+    if args.ckpt is not None and len(args.ckpt) > 0:
+        ckpt = torch.load(args.ckpt, map_location="cpu")
+        model_state = ckpt.get("model", ckpt)
+        try:
+            model.load_state_dict(model_state, strict=True)
+        except Exception:
+            stripped = {k.replace("_orig_mod.", ""): v for k, v in model_state.items()}
+            model.load_state_dict(stripped, strict=True)
+        ema_state = ckpt.get("ema")
+        if ema_state is not None:
+            try:
+                ema_model.load_state_dict(ema_state, strict=True)
+            except Exception:
+                stripped_ema = {k.replace("_orig_mod.", ""): v for k, v in ema_state.items()}
+                ema_model.load_state_dict(stripped_ema, strict=True)
+        else:
+            ema_model.load_state_dict(model.state_dict())
+        print(f"Loaded checkpoint from {args.ckpt}")
+
     @torch.no_grad()
     def ema_update(ema: DiT, online: DiT, decay: float, compiled: bool = True) -> None:
         ema_params = OrderedDict(ema.named_parameters())
@@ -447,9 +471,10 @@ def main() -> None:
         else contextlib.nullcontext()
     )
 
-    # lr scheduler
-    total_steps = max(1, args.epochs * len(train_loader))
-    warmup_steps = max(1, int(len(train_loader)))
+    # lr scheduler (in optimizer steps, respects gradient accumulation)
+    accum_steps = max(1, args.grad_accum)
+    total_steps = max(1, int(math.ceil(args.epochs * len(train_loader) / float(accum_steps))))
+    warmup_steps = max(1, int(math.ceil(len(train_loader) / float(accum_steps))))
 
     def lr_lambda(step: int) -> float:
         step = step + 1
@@ -458,7 +483,7 @@ def main() -> None:
         return max(0.0, float(total_steps - step) / float(max(1, total_steps - warmup_steps)))
 
     scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
-    global_step = 0
+    global_step = 0  # counts optimizer steps
     images_seen = 0
 
     vae = AutoencoderKL.from_pretrained(args.vae).to(device)
@@ -505,14 +530,57 @@ def main() -> None:
     for epoch in range(1, args.epochs + 1):
         running_loss = 0.0
         num_batches = 0
+        accum_loss = 0.0
+        accum_count = 0
+        optimizer.zero_grad()
         for latents, labels in train_loader:
             latents = latents.to(device)
             labels = labels.to(device)
 
             loss = rf.loss(model, latents, labels, amp_ctx=amp_ctx)
 
-            optimizer.zero_grad()
-            loss.backward()
+            (loss / float(accum_steps)).backward()
+            images_seen += latents.shape[0]
+
+            running_loss += loss.item()
+            accum_loss += loss.item()
+            accum_count += 1
+            num_batches += 1
+            tqdm.write("") if False else None
+
+            step_now = (num_batches % accum_steps) == 0
+            if step_now:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=args.max_grad_norm
+                )
+                post_clip_norm = torch.norm(
+                    torch.stack([p.grad.norm(2) for p in model.parameters() if p.grad is not None]), 2
+                )
+                optimizer.step()
+                ema_update(ema_model, model, args.ema_decay)
+                scheduler.step()
+                optimizer.zero_grad()
+                global_step += 1
+
+                # Unified logging/triggering (average loss over micro-batches)
+                avg_loss = accum_loss / float(max(1, accum_count))
+                logger.log_step(
+                    loss_value=avg_loss,
+                    lr=optimizer.param_groups[0]["lr"],
+                    step=global_step,
+                    images_seen=images_seen,
+                    grad_norm=grad_norm.item(),
+                    post_clip_norm=post_clip_norm.item(),
+                )
+                accum_loss = 0.0
+                accum_count = 0
+
+            # Update concise tqdm status
+            pbar.set_description(logger.format_status(images_seen))
+            pbar.update(1)
+
+        # Flush leftover grads at epoch end
+        if (num_batches % accum_steps) != 0 and accum_count > 0:
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.max_grad_norm)
             post_clip_norm = torch.norm(
                 torch.stack([p.grad.norm(2) for p in model.parameters() if p.grad is not None]), 2
@@ -520,26 +588,18 @@ def main() -> None:
             optimizer.step()
             ema_update(ema_model, model, args.ema_decay)
             scheduler.step()
+            optimizer.zero_grad()
             global_step += 1
-            images_seen += latents.shape[0]
 
-            running_loss += loss.item()
-            num_batches += 1
-            tqdm.write("") if False else None
-
-            # Unified logging/triggering
+            avg_loss = accum_loss / float(max(1, accum_count))
             logger.log_step(
-                loss_value=loss.item(),
+                loss_value=avg_loss,
                 lr=optimizer.param_groups[0]["lr"],
                 step=global_step,
                 images_seen=images_seen,
                 grad_norm=grad_norm.item(),
                 post_clip_norm=post_clip_norm.item(),
             )
-
-            # Update concise tqdm status
-            pbar.set_description(logger.format_status(images_seen))
-            pbar.update(1)
     pbar.close()
 
 
