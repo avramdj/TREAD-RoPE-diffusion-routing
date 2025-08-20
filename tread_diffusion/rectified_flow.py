@@ -58,10 +58,12 @@ class RectifiedFlow:
         method: str | None = None,
         cfg_scale: float | None = None,
         apg: bool = False,
+        full_tokens: bool = True,
     ) -> Float[Tensor, "batch in_channels height width"]:
         """Rectified Flow ODE sampling using torchdiffeq."""
         orig_route_config = model.route_config
-        model.route_config = None
+        if full_tokens:
+            model.route_config = None
 
         null_class = model.null_class
         height = height or self.height
@@ -138,10 +140,12 @@ class RectifiedFlow:
         class_labels: Int[Tensor, "batch"] | None = None,
         cfg_scale: float | None = None,
         apg: bool = False,
+        full_tokens: bool = True,
     ) -> Float[Tensor, "batch in_channels height width"]:
         """Rectified Flow ODE sampling using explicit Euler integration."""
         orig_route_config = model.route_config
-        model.route_config = None
+        if full_tokens:
+            model.route_config = None
 
         null_class = model.null_class
         height = height or self.height
