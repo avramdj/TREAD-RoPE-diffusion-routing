@@ -432,13 +432,7 @@ def main() -> None:
 
     torch.set_float32_matmul_precision("high")
     inductor_config.triton.cudagraphs = False
-    model = torch.compile(
-        model,
-        disable=os.getenv("DISABLE_TORCH_COMPILE", "0").lower() in ["1", "true", "yes"],
-        dynamic=True,
-        fullgraph=False,
-        mode="max-autotune-no-cudagraphs",
-    )
+    model = torch.compile(model, dynamic=False, fullgraph=False, mode="max-autotune")
 
     # RECTIFIED FLOW
 

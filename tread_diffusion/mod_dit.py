@@ -102,6 +102,7 @@ class DiTBlock(nn.Module):
         **block_kwargs,
     ):
         super().__init__()
+        self.using_rope = rope is not None
         if rope is not None and rope not in FlexAttentionWithRoPE.ROPE_KINDS:
             raise ValueError("rope must be one of 'axial', 'golden_gate', or None")
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -137,11 +138,14 @@ class DiTBlock(nn.Module):
         self,
         x: Float[Tensor, "batch seq_len hidden_size"],
         c: Float[Tensor, "batch hidden_size"],
+        **rope_kwargs,
     ) -> Float[Tensor, "batch seq_len hidden_size"]:
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(
             6, dim=1
         )
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + gate_msa.unsqueeze(1) * self.attn(
+            modulate(self.norm1(x), shift_msa, scale_msa), **(rope_kwargs if self.using_rope else {})
+        )
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
@@ -176,7 +180,10 @@ class FlexRoPEAttention(nn.Module):
 
     @typed
     def forward(
-        self, x: Float[Tensor, "batch seq_len hidden_size"]
+        self,
+        x: Float[Tensor, "batch seq_len hidden_size"],
+        keep_idx: Int[Tensor, "batch seq_len 1"] | None = None,
+        original_seq_len: int | None = None,
     ) -> Float[Tensor, "batch seq_len hidden_size"]:
         b, t, c = x.shape
         h = self.num_heads
@@ -184,7 +191,7 @@ class FlexRoPEAttention(nn.Module):
             self.qkv(x).view(b, t, 3, h, self.head_dim).permute(0, 3, 1, 2, 4).contiguous()
         )  # [B,H,T,3,D]
         q, k, v = qkv.unbind(dim=3)  # each [B,H,T,D]
-        out = self.attn(q, k, v)  # [B,H,T,D]
+        out = self.attn(q, k, v, keep_idx=keep_idx, original_seq_len=original_seq_len)  # [B,H,T,D]
         out = out.permute(0, 2, 1, 3).contiguous().view(b, t, h * self.head_dim)
         return self.proj(out)
 
@@ -333,7 +340,6 @@ class DiT(nn.Module):
         return x
 
     def route_through_blocks(self, x, c):
-        storage = None
         route_indices = None
         if self.route_config:
             start_block = int(self.route_config["start_block"])  # type: ignore[index]
@@ -351,28 +357,17 @@ class DiT(nn.Module):
 
             if i == start_block and route_indices is None:
                 B, L, C = x.shape
+                x_before_routing = x.clone()
                 num_to_route = max(1, int(L * route_rate))
                 # shuffle L indices between batch
-                rand = torch.rand(B, L, device=x.device)
-                perms = rand.argsort(dim=1)
-                route_indices_BL = perms[:, num_to_route:]
-                route_indices_BLc = route_indices_BL.unsqueeze(-1)
-                non_route_indices_BL = perms[:, :num_to_route]
-                non_route_indices_BLc = non_route_indices_BL.unsqueeze(-1)
-                # storage is [B, num_to_route, C]
-                storage = torch.take_along_dim(x, route_indices_BLc, dim=1)
-                # x is [B, L - num_to_route, C]
-                x = torch.take_along_dim(x, non_route_indices_BLc, dim=1)
+                perms = torch.rand(B, L, device=x.device).argsort(dim=1)
+                keep_idx_BLc = perms[:, :num_to_route].unsqueeze(-1)
+                x = torch.take_along_dim(x, keep_idx_BLc, dim=1)
 
-            x = block(x, c)
+            x = block(x, c, keep_idx=keep_idx_BLc, original_seq_len=L)
 
             if i == end_block:
-                out = torch.empty((B, L, C), device=x.device, dtype=x.dtype)
-                route_scatter_idx = route_indices_BLc.expand(-1, -1, C).long()
-                out.scatter_(1, route_scatter_idx, storage)
-                non_route_scatter_idx = non_route_indices_BLc.expand(-1, -1, C).long()
-                out.scatter_(1, non_route_scatter_idx, x)
-                x = out
+                x = x_before_routing.scatter(1, keep_idx_BLc.expand(-1, -1, C), x)
         return x
 
 

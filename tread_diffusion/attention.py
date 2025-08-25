@@ -5,6 +5,7 @@ from typing import Callable, Final, Literal, Optional, get_args
 
 import torch
 import torch.nn as nn
+from jaxtyping import Int
 from torch import Tensor
 from torch.nn.attention.flex_attention import flex_attention as _flex_attention
 
@@ -74,11 +75,13 @@ class FlexAttentionWithRoPE(nn.Module):
         pos: Optional[Tensor],
         *,
         pos_dim: int,
+        original_seq_len: Optional[int] = None,
     ) -> Tensor:
         """Default 1D positions if none provided. q=[B,H,L,D] -> pos=[B,L,P]."""
         if pos is not None:
             return pos
         batch_size, _, seq_len, _ = q.shape
+        seq_len = original_seq_len if original_seq_len is not None else seq_len
         device = q.device
         positions_1d = torch.arange(seq_len, device=device, dtype=torch.float32)
         if pos_dim == 1:
@@ -97,6 +100,8 @@ class FlexAttentionWithRoPE(nn.Module):
         *,
         pos: Optional[Tensor] = None,
         score_mod: Optional[Callable[[Tensor, Tensor, Tensor, Tensor, Tensor], Tensor]] = None,
+        keep_idx: Optional[Int[Tensor, "batch seq_len 1"]] = None,
+        original_seq_len: Optional[int] = None,
     ) -> Tensor:
         """Returns [B,H,L,D]. Applies RoPE to Q,K then FlexAttention."""
         device = query.device
@@ -112,10 +117,10 @@ class FlexAttentionWithRoPE(nn.Module):
         k_blh_d = key.permute(0, 2, 1, 3).contiguous()
 
         rope_pos_dim: int = self.rope.freqs_hFP.shape[-1]
-        pos_blp = self._ensure_pos(query, pos, pos_dim=rope_pos_dim)
+        pos_blp = self._ensure_pos(query, pos, pos_dim=rope_pos_dim, original_seq_len=original_seq_len)
 
-        q_rot = self.rope(q_blh_d, pos_blp)
-        k_rot = self.rope(k_blh_d, pos_blp)
+        q_rot = self.rope(q_blh_d, pos_blp, keep_idx=keep_idx)
+        k_rot = self.rope(k_blh_d, pos_blp, keep_idx=keep_idx)
 
         q_bhld = q_rot.permute(0, 2, 1, 3).contiguous()
         k_bhld = k_rot.permute(0, 2, 1, 3).contiguous()
