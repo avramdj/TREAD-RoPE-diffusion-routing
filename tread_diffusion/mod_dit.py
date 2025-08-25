@@ -112,7 +112,7 @@ class DiTBlock(nn.Module):
             self.attn = FlexRoPEAttention(
                 hidden_size=hidden_size,
                 num_heads=num_heads,
-                rope_pos_dim=1,
+                rope_pos_dim=2,
                 rope_kind=rope,
                 min_freq=1.0,
                 max_freq=40.0,
@@ -156,7 +156,7 @@ class FlexRoPEAttention(nn.Module):
         hidden_size: int,
         num_heads: int,
         *,
-        rope_pos_dim: int = 1,
+        rope_pos_dim: int = 2,
         rope_kind: str = "golden_gate",
         min_freq: float = 1.0,
         max_freq: float = 40.0,
