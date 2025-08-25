@@ -76,22 +76,22 @@ class GoldenGateRoPENd(RopeImpl):
     @torch.compile
     def forward(
         self,
-        input_NLhd: Float[Tensor, "batch length heads dim"],
-        pos_NLP: Float[Tensor, "batch length pos_dim"],
+        input_BLhd: Float[Tensor, "batch length heads dim"],
+        pos_BLP: Float[Tensor, "batch length pos_dim"],
         keep_idx: Int[Tensor, "batch length 1"] | None = None,
     ) -> Float[Tensor, "batch length heads dim"]:
-        x_NLhF, y_NLhF = input_NLhd.float().chunk(2, dim=-1)
-        theta_NLhF = (self.freqs_hFP * pos_NLP[..., None, None, :].float()).sum(dim=-1)
-        cos_NLhF = torch.cos(theta_NLhF)
-        sin_NLhF = torch.sin(theta_NLhF)
+        x_BLhF, y_BLhF = input_BLhd.float().chunk(2, dim=-1)
+        theta_BLhF = (self.freqs_hFP * pos_BLP[..., None, None, :].float()).sum(dim=-1)
+        cos_BLhF = torch.cos(theta_BLhF)
+        sin_BLhF = torch.sin(theta_BLhF)
         if keep_idx is not None:
-            keep_idx_NL11 = keep_idx.unsqueeze(-1)
-            cos_NLhF = cos_NLhF.take_along_dim(keep_idx_NL11, dim=1)
-            sin_NLhF = sin_NLhF.take_along_dim(keep_idx_NL11, dim=1)
-        x_out_NLhF = x_NLhF * cos_NLhF - y_NLhF * sin_NLhF
-        y_out_NLhF = x_NLhF * sin_NLhF + y_NLhF * cos_NLhF
-        output_NLhd = torch.cat((x_out_NLhF, y_out_NLhF), dim=-1)
-        return output_NLhd.type_as(input_NLhd)
+            keep_idx_BL11 = keep_idx.unsqueeze(-1)
+            cos_BLhF = cos_BLhF.take_along_dim(keep_idx_BL11, dim=1)
+            sin_BLhF = sin_BLhF.take_along_dim(keep_idx_BL11, dim=1)
+        x_out_BLhF = x_BLhF * cos_BLhF - y_BLhF * sin_BLhF
+        y_out_BLhF = x_BLhF * sin_BLhF + y_BLhF * cos_BLhF
+        output_BLhd = torch.cat((x_out_BLhF, y_out_BLhF), dim=-1)
+        return output_BLhd.type_as(input_BLhd)
 
 
 class AxialRoPE(GoldenGateRoPENd):

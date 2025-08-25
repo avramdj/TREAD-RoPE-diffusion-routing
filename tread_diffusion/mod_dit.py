@@ -361,13 +361,13 @@ class DiT(nn.Module):
                 num_to_route = max(1, int(L * route_rate))
                 # shuffle L indices between batch
                 perms = torch.rand(B, L, device=x.device).argsort(dim=1)
-                keep_idx_BLc = perms[:, :num_to_route].unsqueeze(-1)
-                x = torch.take_along_dim(x, keep_idx_BLc, dim=1)
+                keep_idx_BL1 = perms[:, :num_to_route].unsqueeze(-1)
+                x = torch.take_along_dim(x, keep_idx_BL1, dim=1)
 
-            x = block(x, c, keep_idx=keep_idx_BLc, original_seq_len=L)
+            x = block(x, c, keep_idx=keep_idx_BL1, original_seq_len=L)
 
             if i == end_block:
-                x = x_before_routing.scatter(1, keep_idx_BLc.expand(-1, -1, C), x)
+                x = x_before_routing.scatter(1, keep_idx_BL1.expand(-1, -1, C), x)
         return x
 
 
