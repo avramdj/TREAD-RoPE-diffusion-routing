@@ -19,4 +19,11 @@ Diagrams from the paper:
   journal={arXiv preprint arXiv:2501.04765},
   year={2025}
 }
+
+@misc{xiong2025ndrope,
+    author = {Jerry Xiong},
+    title = {On n-dimensional rotary positional embeddings},
+    year = {2025},
+    url = {https://jerryxio.ng/posts/nd-rope/}
+}
 ```
