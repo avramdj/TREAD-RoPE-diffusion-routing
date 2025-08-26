@@ -114,7 +114,7 @@ class DiTBlock(nn.Module):
                 num_heads=num_heads,
                 rope_pos_dim=2,
                 rope_kind=rope,
-                min_freq=1.0,
+                min_freq=0.5,
                 max_freq=40.0,
             )
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -158,7 +158,7 @@ class FlexRoPEAttention(nn.Module):
         *,
         rope_pos_dim: int = 2,
         rope_kind: str = "golden_gate",
-        min_freq: float = 1.0,
+        min_freq: float = 0.5,
         max_freq: float = 40.0,
     ) -> None:
         super().__init__()
