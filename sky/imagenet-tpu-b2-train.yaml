@@ -1,0 +1,40 @@
+resources:
+  infra: gcp/us-central2/us-central2-b
+  accelerators: tpu-v4-8
+  accelerator_args:
+    tpu_name: "imagenet-tpu-b2"
+    runtime_version: tpu-vm-base
+    tpu_vm: true
+
+workdir: .
+
+secrets:
+  WANDB_API_KEY: null
+
+setup: |
+  uv add torch_xla[tpu] 
+  uv sync
+  mkdir -p examples/data/imagenet_int8
+  if [ ! -f examples/data/imagenet_int8/inet.npy ]; then
+    wget -O examples/data/imagenet_int8/inet.npy "https://huggingface.co/ramimmo/mini.imgnet.int8/resolve/main/inet.npy"
+  fi
+  if [ ! -f examples/data/imagenet_int8/inet.json ]; then
+    wget -O examples/data/imagenet_int8/inet.json "https://huggingface.co/ramimmo/mini.imgnet.int8/resolve/main/inet.json"
+  fi
+
+run: |
+  DISABLE_JAX_TYPING=1 uv run torchrun --nproc_per_node=8 "examples/train_imagenet_jax.py" \
+    --epochs 150 \
+    --batch-size 256 \
+    --inet-data examples/data/imagenet_int8/inet.npy \
+    --inet-labels examples/data/imagenet_int8/inet.json \
+    --dit-size DiT-B/2 \
+    --interval-unit steps \
+    --log-images-every 1000 \
+    --log-fid-every -1 \
+    --save-every 1000 \
+    --start-block 2 \
+    --end-block 8 \
+    --grid-n 16 \
+    --wandb-name "DiT-B/2"
+    --rope golden-gate

@@ -35,7 +35,7 @@ class FlexAttentionWithRoPE(nn.Module):
         head_dim: int,
         *,
         pos_dim: int = 1,
-        min_freq: float = 1.0,
+        min_freq: float = 0.5,
         max_freq: float = 40.0,
         p_zero_freqs: float = 0.0,
         rope_kind: RopeKind = "golden_gate",
@@ -131,45 +131,7 @@ class FlexAttentionWithRoPE(nn.Module):
         return out_bhld
 
 
-def flex_attention_rope(
-    query: Tensor,
-    key: Tensor,
-    value: Tensor,
-    *,
-    pos: Optional[Tensor] = None,
-    num_heads: Optional[int] = None,
-    rope_head_dim: Optional[int] = None,
-    pos_dim: int = 1,
-    min_freq: float = 1.0,
-    max_freq: float = 40.0,
-    p_zero_freqs: float = 0.0,
-    rope_kind: RopeKind = "axial",
-    score_mod: Optional[Callable[[Tensor, Tensor, Tensor, Tensor, Tensor], Tensor]] = None,
-) -> Tensor:
-    """Functional wrapper. Shapes: [B,H,L,D]."""
-    if query.ndim != 4:
-        raise ValueError("query must be [batch, heads, seq_len, head_dim]")
-    b, h, seq_len, d = query.shape
-    if key.shape != (b, h, seq_len, d) or value.shape != (b, h, seq_len, d):
-        raise ValueError("key/value must match query shape")
-
-    nh = num_heads if num_heads is not None else h
-    hd = rope_head_dim if rope_head_dim is not None else d
-
-    module = FlexAttentionWithRoPE(
-        num_heads=nh,
-        head_dim=hd,
-        pos_dim=pos_dim,
-        min_freq=min_freq,
-        max_freq=max_freq,
-        p_zero_freqs=p_zero_freqs,
-        rope_kind=rope_kind,
-    )
-    return module(query, key, value, pos=pos, score_mod=score_mod)
-
-
 __all__ = [
     "RopeKind",
     "FlexAttentionWithRoPE",
-    "flex_attention_rope",
 ]
