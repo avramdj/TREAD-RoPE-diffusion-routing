@@ -35,7 +35,7 @@ class FlexAttentionWithRoPE(nn.Module):
         head_dim: int,
         *,
         pos_dim: int = 2,
-        min_freq: float = 1.0,
+        min_freq: float = 0.5,
         max_freq: float = 40.0,
         p_zero_freqs: float = 0.0,
         rope_kind: RopeKind = "golden_gate",

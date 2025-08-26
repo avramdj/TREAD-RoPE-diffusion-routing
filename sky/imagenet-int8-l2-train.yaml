@@ -31,4 +31,5 @@ run: |
     --start-block 2 \
     --end-block 20 \
     --grid-n 16 \
-    --wandb-name "DiT-L/2"
+    --wandb-name "DiT-L/2" \
+    --rope-kind golden_gate
