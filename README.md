@@ -27,3 +27,15 @@ Diagrams from the paper:
     url = {https://jerryxio.ng/posts/nd-rope/}
 }
 ```
+
+## How to Cite
+If you use this implementation in your research, please cite it as follows:
+
+```bibtex
+@software{avram_tread_rope_2025,
+  author = {Avram Djordjevic},
+  title = {TREAD with Golden Gate RoPE},
+  year = {2025},
+  url = {https://github.com/avramdj/TREAD-RoPE-diffusion-routing}
+}
+```
