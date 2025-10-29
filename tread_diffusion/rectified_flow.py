@@ -11,6 +11,37 @@ from tread_diffusion.apg import MomentumBuffer, adaptive_projected_guidance
 from tread_diffusion.typing import typed
 
 
+class ODEFunc(nn.Module):
+    def __init__(
+        self,
+        outer: nn.Module,
+        labels: Tensor,
+        null_labels: Tensor | None,
+        cfg_scale: float | None,
+        apg: bool,
+    ):
+        super().__init__()
+        self.outer = outer
+        self.labels = labels
+        self.null_labels = null_labels
+        self.cfg_scale = cfg_scale
+        self.apg = apg
+        self.momentum_buffer = MomentumBuffer()
+
+    def forward(self, t: Tensor, x: Tensor) -> Tensor:
+        t_vec = t.expand(x.shape[0]).to(x)
+        with torch.no_grad():
+            v = self.outer(x, t_vec, self.labels)
+            if self.null_labels is not None and self.cfg_scale is not None:
+                vnull = self.outer(x, t_vec, self.null_labels)
+                if self.apg:
+                    v = adaptive_projected_guidance(v, vnull, self.cfg_scale, self.momentum_buffer)
+                else:
+                    dd = v - vnull
+                    v = v + self.cfg_scale * dd
+        return v
+
+
 class RectifiedFlow:
     def __init__(
         self,
@@ -82,38 +113,6 @@ class RectifiedFlow:
             if num_classes is None:
                 raise ValueError("num_classes is not set")
             class_labels = torch.randint(0, int(num_classes), (batch_size,), device=device)
-
-        class ODEFunc(nn.Module):
-            def __init__(
-                self,
-                outer: nn.Module,
-                labels: Tensor,
-                null_labels: Tensor | None,
-                cfg_scale: float | None,
-                apg: bool,
-            ):
-                super().__init__()
-                self.outer = outer
-                self.labels = labels
-                self.null_labels = null_labels
-                self.cfg_scale = cfg_scale
-                self.apg = apg
-                self.momentum_buffer = MomentumBuffer()
-
-            def forward(self, t: Tensor, x: Tensor) -> Tensor:
-                t_vec = t.expand(x.shape[0]).to(x)
-                with torch.no_grad():
-                    v = self.outer(x, t_vec, self.labels)
-                    if self.null_labels is not None and self.cfg_scale is not None:
-                        vnull = self.outer(x, t_vec, self.null_labels)
-                        if self.apg:
-                            v = adaptive_projected_guidance(
-                                v, vnull, self.cfg_scale, self.momentum_buffer
-                            )
-                        else:
-                            dd = v - vnull
-                            v = v + self.cfg_scale * dd
-                return v
 
         if null_class is not None and cfg_scale is not None:
             null_labels = torch.full_like(class_labels, null_class)

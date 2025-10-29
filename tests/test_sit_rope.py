@@ -1,11 +1,11 @@
 import pytest
 import torch
 
-from tread_diffusion import DiT
+from tread_diffusion import SiT
 
 
 def _forward_once(rope):
-    model = DiT(
+    model = SiT(
         input_size=8,
         patch_size=2,
         in_channels=4,

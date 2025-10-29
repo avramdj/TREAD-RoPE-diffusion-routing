@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from diffusers import AutoencoderKL
 from diffusers.image_processor import VaeImageProcessor
 from dotenv import load_dotenv
@@ -17,6 +18,7 @@ from torch import Tensor
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torchvision.utils import make_grid
 from tqdm.auto import tqdm
@@ -68,12 +70,13 @@ class TrainingLogger:
         sample_seed: int,
         rf: RectifiedFlow,
         save_name: str,
+        is_main: bool,
     ) -> None:
         self.device = device
         self.vae = vae
         self.train_loader = train_loader
-        self.model = model
-        self.ema_model = ema_model
+        self.model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        self.ema_model = ema_model.module if isinstance(ema_model, torch.nn.parallel.DistributedDataParallel) else ema_model
         self.grid_n = grid_n
         self.timesteps = timesteps
         self.fid_samples = fid_samples
@@ -89,6 +92,7 @@ class TrainingLogger:
         self.real_logged_once = False
         self.rf = rf
         self.save_name = save_name
+        self.is_main = is_main
 
     def log_step(
         self,
@@ -100,6 +104,8 @@ class TrainingLogger:
         grad_norm: float,
         post_clip_norm: float,
     ) -> None:
+        if not self.is_main:
+            return
         wandb.log(
             {
                 "train/loss": loss_value,
@@ -154,6 +160,8 @@ class TrainingLogger:
 
     @torch.no_grad()
     def _compute_and_log_fid(self, *, step: int, images_seen: int) -> None:
+        if not self.is_main:
+            return
         fid = FrechetInceptionDistance(feature=2048, normalize=True).to(self.device)
         real_added = 0
         for latents_eval, _ in self.train_loader:
@@ -186,6 +194,8 @@ class TrainingLogger:
 
     @torch.no_grad()
     def _log_sample_images(self, *, step: int, images_seen: int) -> None:
+        if not self.is_main:
+            return
         b = self.grid_n
         # Save and restore RNG state to keep sampling deterministic without affecting training RNG
         cpu_state = torch.random.get_rng_state()
@@ -258,8 +268,11 @@ class TrainingLogger:
             torch.cuda.set_rng_state(cuda_state, self.device)
 
     def _save_checkpoint(self, *, step: int, images_seen: int) -> None:
+        if not self.is_main:
+            return
         ckpt_path = self.save_dir / f"{self.save_name}.pt"
-        torch.save({"model": self.model.state_dict(), "ema": self.ema_model.state_dict()}, ckpt_path)
+        model_to_save = self.model.module if isinstance(self.model, torch.nn.parallel.DistributedDataParallel) else self.model
+        torch.save({"model": model_to_save.state_dict(), "ema": self.ema_model.state_dict()}, ckpt_path)
         print(f"Saved checkpoint to {ckpt_path}")
 
 
@@ -331,8 +344,27 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    torch.manual_seed(args.seed)
-    device = torch.device(args.device)
+    # -------------------- DDP setup --------------------
+    ddp_env_present = ("RANK" in os.environ) or ("LOCAL_RANK" in os.environ)
+    if dist.is_available() and ddp_env_present and not dist.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend)
+
+    world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    local_rank = int(os.environ.get("LOCAL_RANK", rank)) if torch.cuda.is_available() else 0
+    is_main = rank == 0
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device(args.device)
+
+    # Seed per-rank for data shuffling reproducibility
+    torch.manual_seed(args.seed + rank)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed + rank)
 
     # Resolve intervals: defaults in steps, convert to images if needed
     default_fid_steps = 10000
@@ -362,14 +394,34 @@ def main() -> None:
 
     # ImageNet.int8 latent dataset
     train_ds = ImageNetInt8LatentDataset(args.inet_data, args.inet_labels)
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.workers,
-        pin_memory=(device.type == "cuda"),
-        drop_last=True,
-    )
+    # Distributed-aware sampler and loader
+    if dist.is_available() and dist.is_initialized():
+        train_sampler = DistributedSampler(
+            train_ds,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            drop_last=True,
+        )
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            sampler=train_sampler,
+            num_workers=args.workers,
+            pin_memory=(device.type == "cuda"),
+            drop_last=True,
+        )
+    else:
+        train_sampler = None
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.workers,
+            pin_memory=(device.type == "cuda"),
+            drop_last=True,
+        )
 
     # Small SiT (reasonable defaults)
     rope_arg = None if args.rope == "none" else args.rope
@@ -424,8 +476,12 @@ def main() -> None:
         online_params = OrderedDict(online.named_parameters())
         for name, param in online_params.items():
             if param.requires_grad:
-                ema_name = name.replace("_orig_mod.", "") if compiled else name
-                ema_params[ema_name].mul_(decay).add_(online_params[name].data, alpha=1 - decay)
+                source_name = name
+                if source_name.startswith("module."):
+                    source_name = source_name[len("module."):]
+                ema_name = source_name.replace("_orig_mod.", "") if compiled else source_name
+                if ema_name in ema_params:
+                    ema_params[ema_name].mul_(decay).add_(online_params[name].data, alpha=1 - decay)
 
     # Compile and precision stuff
     from torch._inductor import config as inductor_config
@@ -434,27 +490,40 @@ def main() -> None:
     inductor_config.triton.cudagraphs = False
     model = torch.compile(model, dynamic=False, fullgraph=False, mode="max-autotune-no-cudagraphs")
 
+    # Wrap with DDP after compile
+    if dist.is_available() and dist.is_initialized():
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[local_rank] if device.type == "cuda" else None,
+            output_device=local_rank if device.type == "cuda" else None,
+            broadcast_buffers=False,
+            find_unused_parameters=False,
+        )
+
     # RECTIFIED FLOW
 
-    wandb_project = os.getenv("WANDB_PROJECT", "tread-diffusion-imagenet-int8")
-    wandb.init(
-        project=wandb_project,
-        name=args.wandb_name,
-        config={
-            "epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "lr": args.lr,
-            "timesteps": args.timesteps,
-            "rope": args.rope,
-            "route_config": route_config,
-            "inet_data": args.inet_data,
-            "inet_labels": args.inet_labels,
-            "vae": args.vae,
-        },
-    )
+    if is_main:
+        wandb_project = os.getenv("WANDB_PROJECT", "tread-diffusion-imagenet-int8")
+        wandb.init(
+            project=wandb_project,
+            name=args.wandb_name,
+            config={
+                "epochs": args.epochs,
+                "batch_size": args.batch_size,
+                "lr": args.lr,
+                "timesteps": args.timesteps,
+                "rope": args.rope,
+                "route_config": route_config,
+                "inet_data": args.inet_data,
+                "inet_labels": args.inet_labels,
+                "vae": args.vae,
+                "world_size": world_size,
+            },
+        )
 
     model.train()
-    Path(args.save_dir).mkdir(parents=True, exist_ok=True)
+    if is_main:
+        Path(args.save_dir).mkdir(parents=True, exist_ok=True)
 
     if device.type == "cuda":
         assert torch.cuda.is_bf16_supported(), "bf16 is not supported on this GPU broke boy"
@@ -478,7 +547,7 @@ def main() -> None:
 
     scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
     global_step = 0  # counts optimizer steps
-    images_seen = 0
+    images_seen_local = 0
 
     vae = AutoencoderKL.from_pretrained(args.vae).to(device)
     vae.eval()
@@ -507,21 +576,25 @@ def main() -> None:
         sample_seed=1337,
         rf=rf,
         save_name=args.save_name,
+        is_main=is_main,
     )
 
     # Print concise hook schedule (in steps)
     def fmt_k(val: int) -> str:
         return f"{val / 1000.0:.2f}K" if val >= 1000 else f"{val}"
 
-    print(
-        f"Logging: FID every {fmt_k(fid_steps)} steps, "
-        f"Images every {fmt_k(img_steps)} steps, "
-        f"Ckpt every {fmt_k(ckp_steps)} steps. Batch={args.batch_size}"
-    )
+    if is_main:
+        print(
+            f"Logging: FID every {fmt_k(fid_steps)} steps, "
+            f"Images every {fmt_k(img_steps)} steps, "
+            f"Ckpt every {fmt_k(ckp_steps)} steps. Batch={args.batch_size}"
+        )
 
     total_steps = args.epochs * len(train_loader)
-    pbar = tqdm(total=total_steps, desc=logger.format_status(images_seen), leave=True)
+    pbar = tqdm(total=total_steps, desc=logger.format_status(0), leave=True) if is_main else None
     for epoch in range(1, args.epochs + 1):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         running_loss = 0.0
         num_batches = 0
         accum_loss = 0.0
@@ -533,8 +606,13 @@ def main() -> None:
 
             loss = rf.loss(model, latents, labels, amp_ctx=amp_ctx)
 
-            (loss / float(accum_steps)).backward()
-            images_seen += latents.shape[0]
+            # Accumulate gradients; avoid DDP sync on micro-steps for efficiency
+            if (num_batches + 1) % accum_steps != 0 and dist.is_available() and dist.is_initialized():
+                with model.no_sync():
+                    (loss / float(accum_steps)).backward()
+            else:
+                (loss / float(accum_steps)).backward()
+            images_seen_local += latents.shape[0]
 
             running_loss += loss.item()
             accum_loss += loss.item()
@@ -558,11 +636,12 @@ def main() -> None:
 
                 # Unified logging/triggering (average loss over micro-batches)
                 avg_loss = accum_loss / float(max(1, accum_count))
+                total_images_seen = images_seen_local * world_size
                 logger.log_step(
                     loss_value=avg_loss,
                     lr=optimizer.param_groups[0]["lr"],
                     step=global_step,
-                    images_seen=images_seen,
+                    images_seen=total_images_seen,
                     grad_norm=grad_norm.item(),
                     post_clip_norm=post_clip_norm.item(),
                 )
@@ -570,8 +649,9 @@ def main() -> None:
                 accum_count = 0
 
             # Update concise tqdm status
-            pbar.set_description(logger.format_status(images_seen))
-            pbar.update(1)
+            if is_main and pbar is not None:
+                pbar.set_description(logger.format_status(images_seen_local * world_size))
+                pbar.update(1)
 
         # Flush leftover grads at epoch end
         if (num_batches % accum_steps) != 0 and accum_count > 0:
@@ -590,11 +670,17 @@ def main() -> None:
                 loss_value=avg_loss,
                 lr=optimizer.param_groups[0]["lr"],
                 step=global_step,
-                images_seen=images_seen,
+                images_seen=images_seen_local * world_size,
                 grad_norm=grad_norm.item(),
                 post_clip_norm=post_clip_norm.item(),
             )
-    pbar.close()
+    if is_main and pbar is not None:
+        pbar.close()
+
+    # Clean up DDP
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

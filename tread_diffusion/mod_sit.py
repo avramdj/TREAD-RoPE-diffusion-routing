@@ -91,7 +91,7 @@ class LabelEmbedder(nn.Module):
         return embeddings
 
 
-class DiTBlock(nn.Module):
+class SiTBlock(nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -217,7 +217,7 @@ class FinalLayer(nn.Module):
         return x
 
 
-class DiT(nn.Module):
+class SiT(nn.Module):
     def __init__(
         self,
         input_size: int = 32,
@@ -261,7 +261,7 @@ class DiT(nn.Module):
             self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList(
-            [DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, rope=rope) for _ in range(depth)]
+            [SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, rope=rope) for _ in range(depth)]
         )
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
@@ -314,7 +314,7 @@ class DiT(nn.Module):
         c = self.out_channels
         p = self.x_embedder.patch_size[0]
         h = w = int(x.shape[1] ** 0.5)
-        assert h * w == x.shape[1]
+        assert h * w == x.shape[1], f"{h} * {w} != {x.shape[1]}. x.shape: {x.shape}"
 
         x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
         x = torch.einsum("nhwpqc->nchpwq", x)
@@ -349,6 +349,15 @@ class DiT(nn.Module):
             start_block = -1
             end_block = -1
             route_rate = 0.0
+
+        if start_block != -1 and end_block != -1:
+            if start_block >= end_block:
+                raise ValueError(f"start_block: {start_block} >= end_block: {end_block}")
+            if end_block >= len(self.blocks):
+                raise ValueError(
+                    f"end_block: {end_block} >= len(self.blocks): {len(self.blocks)}"
+                    "For optimal start and end configurations, please consult Table S8 in https://arxiv.org/abs/2501.04765"
+                )
 
         for i, block in enumerate(self.blocks):
             if not self.route_config or i < start_block or i > end_block:
@@ -420,65 +429,65 @@ def get_1d_sincos_pos_embed_from_grid(
     return emb
 
 
-def DiT_XL_2(**kwargs):
-    return DiT(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
+def SiT_XL_2(**kwargs):
+    return SiT(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
 
 
-def DiT_XL_4(**kwargs):
-    return DiT(depth=28, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
+def SiT_XL_4(**kwargs):
+    return SiT(depth=28, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
 
 
-def DiT_XL_8(**kwargs):
-    return DiT(depth=28, hidden_size=1152, patch_size=8, num_heads=16, **kwargs)
+def SiT_XL_8(**kwargs):
+    return SiT(depth=28, hidden_size=1152, patch_size=8, num_heads=16, **kwargs)
 
 
-def DiT_L_2(**kwargs):
-    return DiT(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
+def SiT_L_2(**kwargs):
+    return SiT(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
 
 
-def DiT_L_4(**kwargs):
-    return DiT(depth=24, hidden_size=1024, patch_size=4, num_heads=16, **kwargs)
+def SiT_L_4(**kwargs):
+    return SiT(depth=24, hidden_size=1024, patch_size=4, num_heads=16, **kwargs)
 
 
-def DiT_L_8(**kwargs):
-    return DiT(depth=24, hidden_size=1024, patch_size=8, num_heads=16, **kwargs)
+def SiT_L_8(**kwargs):
+    return SiT(depth=24, hidden_size=1024, patch_size=8, num_heads=16, **kwargs)
 
 
-def DiT_B_2(**kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
+def SiT_B_2(**kwargs):
+    return SiT(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
 
 
-def DiT_B_4(**kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=4, num_heads=12, **kwargs)
+def SiT_B_4(**kwargs):
+    return SiT(depth=12, hidden_size=768, patch_size=4, num_heads=12, **kwargs)
 
 
-def DiT_B_8(**kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=8, num_heads=12, **kwargs)
+def SiT_B_8(**kwargs):
+    return SiT(depth=12, hidden_size=768, patch_size=8, num_heads=12, **kwargs)
 
 
-def DiT_S_2(**kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=2, num_heads=6, **kwargs)
+def SiT_S_2(**kwargs):
+    return SiT(depth=12, hidden_size=384, patch_size=2, num_heads=6, **kwargs)
 
 
-def DiT_S_4(**kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=4, num_heads=6, **kwargs)
+def SiT_S_4(**kwargs):
+    return SiT(depth=12, hidden_size=384, patch_size=4, num_heads=6, **kwargs)
 
 
-def DiT_S_8(**kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
+def SiT_S_8(**kwargs):
+    return SiT(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
 
 
-DiT_models = {
-    "DiT-XL/2": DiT_XL_2,
-    "DiT-XL/4": DiT_XL_4,
-    "DiT-XL/8": DiT_XL_8,
-    "DiT-L/2": DiT_L_2,
-    "DiT-L/4": DiT_L_4,
-    "DiT-L/8": DiT_L_8,
-    "DiT-B/2": DiT_B_2,
-    "DiT-B/4": DiT_B_4,
-    "DiT-B/8": DiT_B_8,
-    "DiT-S/2": DiT_S_2,
-    "DiT-S/4": DiT_S_4,
-    "DiT-S/8": DiT_S_8,
+SiT_models = {
+    "SiT-XL/2": SiT_XL_2,
+    "SiT-XL/4": SiT_XL_4,
+    "SiT-XL/8": SiT_XL_8,
+    "SiT-L/2": SiT_L_2,
+    "SiT-L/4": SiT_L_4,
+    "SiT-L/8": SiT_L_8,
+    "SiT-B/2": SiT_B_2,
+    "SiT-B/4": SiT_B_4,
+    "SiT-B/8": SiT_B_8,
+    "SiT-S/2": SiT_S_2,
+    "SiT-S/4": SiT_S_4,
+    "SiT-S/8": SiT_S_8,
 }

@@ -19,7 +19,7 @@ from torchvision.utils import make_grid
 from tqdm.auto import tqdm
 
 import wandb
-from tread_diffusion import DiT, DiT_models
+from tread_diffusion import SiT, SiT_models
 from tread_diffusion.rectified_flow import RectifiedFlow
 
 
@@ -31,8 +31,8 @@ class TrainingLogger:
         *,
         device: torch.device,
         train_loader: DataLoader,
-        model: DiT,
-        ema_model: DiT,
+        model: SiT,
+        ema_model: SiT,
         grid_n: int,
         timesteps: int,
         fid_samples: int,
@@ -216,7 +216,7 @@ class TrainingLogger:
             torch.cuda.set_rng_state(cuda_state, self.device)
 
     def _save_checkpoint(self, *, step: int, images_seen: int) -> None:
-        ckpt_path = self.save_dir / "dit_mnist_step-latest.pt"
+        ckpt_path = self.save_dir / "sit_mnist_step-latest.pt"
         torch.save({"model": self.model.state_dict(), "ema": self.ema_model.state_dict()}, ckpt_path)
         print(f"Saved checkpoint to {ckpt_path}")
 
@@ -227,7 +227,7 @@ def decode_latents(latents: Tensor) -> Tensor:
 
 @torch.no_grad()
 def sample_model(
-    model: DiT,
+    model: SiT,
     *,
     num_images: int,
     num_steps: int,
@@ -243,7 +243,7 @@ def sample_model(
 
 def main() -> None:
     load_dotenv()
-    parser = argparse.ArgumentParser(description="Train DiT on MNIST")
+    parser = argparse.ArgumentParser(description="Train SiT on MNIST")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -267,7 +267,7 @@ def main() -> None:
         "--save-every", type=int, default=None, help="Interval value; unit set by --interval-unit"
     )
     parser.add_argument("--interval-unit", type=str, choices=["steps", "images"], default="steps")
-    parser.add_argument("--dit-size", type=str, default="DiT-S/2", choices=DiT_models.keys())
+    parser.add_argument("--sit-size", type=str, default="SiT-S/2", choices=SiT_models.keys())
     parser.add_argument("--start-block", type=int, default=2)
     parser.add_argument("--end-block", type=int, default=10)
     parser.add_argument("--max-grad-norm", type=float, default=2.0)
@@ -325,7 +325,7 @@ def main() -> None:
         drop_last=True,
     )
 
-    # Small DiT (reasonable defaults)
+    # Small SiT (reasonable defaults)
     rope_arg = None if args.rope == "none" else args.rope
     route_config = {
         "start_block": args.start_block,
@@ -333,7 +333,7 @@ def main() -> None:
         "rate": 0.5,
         "mix_factor": 0.5,
     }
-    dit_args = {
+    sit_args = {
         "input_size": 32,
         "in_channels": 1,
         "num_classes": 10,
@@ -341,19 +341,19 @@ def main() -> None:
         "rope": rope_arg,
         "route_config": route_config,
     }
-    model = DiT_models[args.dit_size](**dit_args).to(device)
+    model = SiT_models[args.sit_size](**sit_args).to(device)
 
     optimizer = AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=0.01)
 
     # EMA model (kept in eval mode)
-    ema_model = DiT_models[args.dit_size](**dit_args).to(device)
+    ema_model = SiT_models[args.sit_size](**sit_args).to(device)
     ema_model.load_state_dict(model.state_dict())
     ema_model.eval()
     for p in ema_model.parameters():
         p.requires_grad_(False)
 
     @torch.no_grad()
-    def ema_update(ema: DiT, online: DiT, decay: float) -> None:
+    def ema_update(ema: SiT, online: SiT, decay: float) -> None:
         for ema_p, p in zip(ema.parameters(), online.parameters()):
             ema_p.data.mul_(decay).add_(p.data, alpha=1.0 - decay)
         for ema_buf, buf in zip(ema.buffers(), online.buffers()):

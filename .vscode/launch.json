@@ -1,0 +1,52 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Train ImageNet (SiT-B/2)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "examples/train_imagenet.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "--epochs",
+                "150",
+                "--batch-size",
+                "32",
+                "--inet-data",
+                "examples/data/imagenet_int8/inet.npy",
+                "--inet-labels",
+                "examples/data/imagenet_int8/inet.json",
+                "--sit-size",
+                "SiT-B/2",
+                "--interval-unit",
+                "steps",
+                "--log-images-every",
+                "1000",
+                "--log-fid-every",
+                "-1",
+                "--save-every",
+                "1000",
+                "--start-block",
+                "2",
+                "--end-block",
+                "8",
+                "--grid-n",
+                "9",
+                "--wandb-name",
+                "SiT-B-2",
+                "--rope",
+                "golden_gate"
+            ],
+            "env": {
+                "DISABLE_JAX_TYPING": "1",
+                "TORCH_COMPILE_DISABLE": "1",
+                "CUDA_VISIBLE_DEVICES": "1"
+            }
+        }
+    ]
+}

@@ -1,5 +1,5 @@
 from .attention import FlexAttentionWithRoPE, RopeKind
-from .mod_dit import DiT, DiT_models
+from .mod_sit import SiT, SiT_models
 from .rectified_flow import RectifiedFlow
 from .rope import AxialRoPE, GoldenGateRoPENd
 
@@ -8,7 +8,7 @@ __all__ = [
     "FlexAttentionWithRoPE",
     "AxialRoPE",
     "GoldenGateRoPENd",
-    "DiT",
-    "DiT_models",
+    "SiT",
+    "SiT_models",
     "RectifiedFlow",
 ]

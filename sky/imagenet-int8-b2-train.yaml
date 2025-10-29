@@ -23,7 +23,7 @@ run: |
     --batch-size 512 \
     --inet-data examples/data/imagenet_int8/inet.npy \
     --inet-labels examples/data/imagenet_int8/inet.json \
-    --dit-size DiT-B/2 \
+    --sit-size SiT-B/2 \
     --interval-unit steps \
     --log-images-every 1000 \
     --log-fid-every -1 \

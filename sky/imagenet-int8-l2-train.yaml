@@ -23,7 +23,7 @@ run: |
     --batch-size 256 \
     --inet-data examples/data/imagenet_int8/inet.npy \
     --inet-labels examples/data/imagenet_int8/inet.json \
-    --dit-size DiT-L/2 \
+    --sit-size SiT-L/2 \
     --interval-unit steps \
     --log-images-every 1000 \
     --log-fid-every -1 \
@@ -31,5 +31,5 @@ run: |
     --start-block 2 \
     --end-block 20 \
     --grid-n 16 \
-    --wandb-name "DiT-L/2" \
+    --wandb-name "SiT-L/2" \
     --rope-kind golden_gate
