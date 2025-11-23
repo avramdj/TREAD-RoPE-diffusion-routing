@@ -38,7 +38,7 @@ class ODEFunc(nn.Module):
                     v = adaptive_projected_guidance(v, vnull, self.cfg_scale, self.momentum_buffer)
                 else:
                     dd = v - vnull
-                    v = v + self.cfg_scale * dd
+                    v = vnull + self.cfg_scale * dd
         return v
 
 
